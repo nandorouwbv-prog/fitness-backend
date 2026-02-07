@@ -364,17 +364,25 @@ if (q === "push up") {
 }
 
 // ✅ Special fallback for push-ups (ExerciseDB variants)
+// ✅ HARD OVERRIDE for push-up (ExerciseDB has no plain "push-up")
 if (q === "push-up") {
   const male = await fetchByNameOnce("push-up (male)");
   if (male.ex) {
-    return { ex: male.ex, dbg: { step: "pushup-male" } };
+    return { ex: male.ex, dbg: { step: "pushup-male-forced" } };
   }
 
   const female = await fetchByNameOnce("push-up (female)");
   if (female.ex) {
-    return { ex: female.ex, dbg: { step: "pushup-female" } };
+    return { ex: female.ex, dbg: { step: "pushup-female-forced" } };
+  }
+
+  // absolute last fallback
+  const bodyweight = await fetchByNameOnce("bodyweight push-up");
+  if (bodyweight.ex) {
+    return { ex: bodyweight.ex, dbg: { step: "pushup-bodyweight" } };
   }
 }
+
 
 // ✅ Deadlift generic fallback
 if (q === "deadlift") {
