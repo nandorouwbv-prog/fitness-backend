@@ -506,10 +506,8 @@ export async function POST(req: Request) {
           continue;
         }
 
-        const imageUrl = `/api/exercises/image?exerciseId=${encodeURIComponent(
-          ex.id
-        )}&resolution=180`;
-
+     const imageUrl = `/api/exercises/image?exerciseId=${encodeURIComponent(ex.id)}`;
+     
         const shaped = {
           id: ex.id,
           name: ex.name,

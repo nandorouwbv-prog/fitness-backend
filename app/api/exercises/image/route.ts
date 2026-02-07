@@ -11,22 +11,20 @@ function getHeaders() {
   };
 }
 
-async function fetchImage(exerciseId: string, resolution: string) {
+async function fetchImage(exerciseId: string, resolution?: string) {
+  const base = "https://exercisedb.p.rapidapi.com/image";
   const url =
-    "https://exercisedb.p.rapidapi.com/image" +
-    `?exerciseId=${encodeURIComponent(exerciseId)}` +
-    `&resolution=${encodeURIComponent(resolution)}`;
+    resolution && resolution.length > 0
+      ? `${base}?exerciseId=${encodeURIComponent(exerciseId)}&resolution=${encodeURIComponent(resolution)}`
+      : `${base}?exerciseId=${encodeURIComponent(exerciseId)}`;
 
-  return fetch(url, {
-    headers: getHeaders(),
-    cache: "no-store",
-  });
+  return fetch(url, { headers: getHeaders(), cache: "no-store" });
 }
 
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
   const exerciseId = searchParams.get("exerciseId");
-  const resolution = searchParams.get("resolution") ?? "180";
+  const resolution = searchParams.get("resolution") ?? undefined;
 
   if (!exerciseId) {
     return NextResponse.json(
@@ -35,13 +33,17 @@ export async function GET(req: Request) {
     );
   }
 
-  // 1) try requested resolution first
-  let upstream = await fetchImage(exerciseId, resolution);
+  // 1) ✅ eerst zonder resolution (hoogste hit rate)
+  let upstream = await fetchImage(exerciseId);
 
-  // 2) fallback resolutions (many ids don't have 180)
+  // 2) als dat faalt: probeer requested resolution (als die meegegeven werd)
+  if (!upstream.ok && resolution) {
+    upstream = await fetchImage(exerciseId, resolution);
+  }
+
+  // 3) als dat faalt: fallback resoluties
   if (!upstream.ok) {
-    for (const r of ["360", "90", "180"]) {
-      if (r === resolution) continue;
+    for (const r of ["180", "360", "90"]) {
       const attempt = await fetchImage(exerciseId, r);
       if (attempt.ok) {
         upstream = attempt;
