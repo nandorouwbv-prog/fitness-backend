@@ -344,6 +344,25 @@ async function fetchByName(query: string) {
 
   const primary = await fetchByNameOnce(q);
   if (primary.ex) return primary;
+  // ✅ Force correct push-up (avoid "clock push-up")
+if (q === "push up") {
+  const direct = await fetchByNameOnce("push-up");
+  if (direct.ex && normName(direct.ex.name) === "push-up") {
+    return { ex: direct.ex, dbg: { step: "pushup-exact" } };
+  }
+
+  const space = await fetchByNameOnce("push up");
+  if (space.ex && normName(space.ex.name) === "push up") {
+    return { ex: space.ex, dbg: { step: "pushup-space-exact" } };
+  }
+
+  const male = await fetchByNameOnce("push-up (male)");
+  if (male.ex) return { ex: male.ex, dbg: { step: "pushup-male" } };
+
+  const female = await fetchByNameOnce("push-up (female)");
+  if (female.ex) return { ex: female.ex, dbg: { step: "pushup-female" } };
+}
+
 // ✅ Special fallback for push-ups (ExerciseDB variants)
 if (q === "push-up") {
   const male = await fetchByNameOnce("push-up (male)");
