@@ -43,24 +43,28 @@ function canonicalQuery(raw: string) {
   const q = normName(raw);
 
   const map: Record<string, string> = {
-    // curls
-    "dumbbell bicep curl": "dumbbell curl",
-    "dumbbell biceps curl": "dumbbell curl",
-    "bicep curl": "dumbbell curl", // safer default for common plans
-    "hammer curl": "dumbbell hammer curl",
+// curls
+"dumbbell bicep curl": "dumbbell curl",
+"dumbbell biceps curl": "dumbbell curl",
+"bicep curl": "dumbbell curl",
+"hammer curl": "dumbbell hammer curl",
 
-    // pushups
-    "push up": "push-up",
-    "pushup": "push-up",
+// push-ups
+"push-up": "push-up",
+"push up": "push-up",
+"pushup": "push-up",
+"bodyweight push up": "push-up",
 
-    // deadlift variants
-    "deadlift ( light weight )": "deadlift",
-    "deadlift (light weight)": "deadlift",
-    "deadlift light weight": "deadlift",
-    "light weight deadlift": "deadlift",
+// deadlift light variants
+"deadlift ( light weight )": "deadlift",
+"deadlift (light weight)": "deadlift",
+"deadlift light weight": "deadlift",
+"light weight deadlift": "deadlift",
 
     // common wording variants
     "lat pulldown": "lat pulldown",
+
+    
   };
 
   return map[q] ?? q;
@@ -340,6 +344,26 @@ async function fetchByName(query: string) {
 
   const primary = await fetchByNameOnce(q);
   if (primary.ex) return primary;
+// ✅ Special fallback for push-ups (ExerciseDB variants)
+if (q === "push-up") {
+  const male = await fetchByNameOnce("push-up (male)");
+  if (male.ex) {
+    return { ex: male.ex, dbg: { step: "pushup-male" } };
+  }
+
+  const female = await fetchByNameOnce("push-up (female)");
+  if (female.ex) {
+    return { ex: female.ex, dbg: { step: "pushup-female" } };
+  }
+}
+
+// ✅ Deadlift generic fallback
+if (q === "deadlift") {
+  const dl = await fetchByNameOnce("barbell deadlift");
+  if (dl.ex) {
+    return { ex: dl.ex, dbg: { step: "deadlift-barbell" } };
+  }
+}
 
   const tryBarbell = await fetchByNameOnce(`barbell ${q}`);
   if (tryBarbell.ex)
