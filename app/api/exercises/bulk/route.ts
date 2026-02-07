@@ -20,11 +20,13 @@ const g = globalThis as any;
 g.__exerciseNameCache ??= new Map<string, CacheEntry>();
 const nameCache: Map<string, CacheEntry> = g.__exerciseNameCache;
 
-// ✅ cache for the full exercise list (used for fuzzy fallback)
+// cache for full exercise list
 g.__exerciseAllCache ??= null as null | { value: Exercise[]; expiresAt: number };
 
 const TTL_MS = 1000 * 60 * 60 * 24; // 24h
 const ALL_TTL_MS = 1000 * 60 * 60 * 6; // 6h
+
+const VERSION = "bulk-v5-pagination+scoring";
 
 function normName(s: string) {
   return String(s ?? "")
@@ -35,7 +37,7 @@ function normName(s: string) {
 
 function cacheGet(key: string) {
   const hit = nameCache.get(key);
-  if (!hit) return undefined; // undefined => not cached; null can be cached value
+  if (!hit) return undefined;
   if (Date.now() > hit.expiresAt) {
     nameCache.delete(key);
     return undefined;
@@ -47,140 +49,227 @@ function cacheSet(key: string, value: any) {
   nameCache.set(key, { value, expiresAt: Date.now() + TTL_MS });
 }
 
-/**
- * ✅ Robust headers for RapidAPI in Vercel/Next runtimes:
- * use Headers() + Accept to prevent weird stripping / mismatch.
- */
-function getRapidHeaders() {
+function getHeaders() {
   const RAPIDAPI_KEY = process.env.EXERCISEDB_RAPIDAPI_KEY;
   if (!RAPIDAPI_KEY) throw new Error("Missing EXERCISEDB_RAPIDAPI_KEY env var");
 
-  const h = new Headers();
-  h.set("X-RapidAPI-Key", RAPIDAPI_KEY);
-  h.set("X-RapidAPI-Host", "exercisedb.p.rapidapi.com");
-  h.set("Accept", "application/json");
-  return h;
+  return {
+    "X-RapidAPI-Key": RAPIDAPI_KEY,
+    "X-RapidAPI-Host": "exercisedb.p.rapidapi.com",
+    Accept: "application/json",
+  };
 }
 
-async function fetchByNameOnce(query: string): Promise<Exercise | null> {
-  const headers = getRapidHeaders();
+async function fetchJson(url: string) {
+  const headers = getHeaders();
+  const res = await fetch(url, { headers, cache: "no-store" });
 
-  const url =
-    "https://exercisedb.p.rapidapi.com/exercises/name/" +
-    encodeURIComponent(query);
+  const contentType = res.headers.get("content-type") ?? "";
+  let json: any = null;
+  let text: string | null = null;
 
-  const res = await fetch(url, {
-    method: "GET",
-    headers,
-    cache: "no-store",
-  });
-
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    console.log("[ExerciseDB] name lookup failed", {
-      query,
-      status: res.status,
-      body: txt.slice(0, 200),
-    });
-    return null;
+  if (contentType.includes("application/json")) {
+    json = await res.json().catch(() => null);
+  } else {
+    text = await res.text().catch(() => null);
   }
 
-  const data = (await res.json().catch(() => null)) as Exercise[] | null;
-  if (!Array.isArray(data) || data.length === 0) return null;
-
-  const lower = query.toLowerCase().trim();
-
-  const exact = data.find(
-    (x) => String(x?.name ?? "").toLowerCase().trim() === lower
-  );
-  if (exact) return exact;
-
-  const preferred = data.find((x) =>
-    ["barbell", "dumbbell", "machine", "body weight"].includes(
-      String(x?.equipment ?? "").toLowerCase().trim()
-    )
-  );
-
-  return preferred ?? data[0] ?? null;
-}
-
-// ✅ Fetch all exercises once (cached) for fuzzy matching
-async function fetchAllExercises(): Promise<Exercise[] | null> {
-  const now = Date.now();
-  const cached = g.__exerciseAllCache as
-    | null
-    | { value: Exercise[]; expiresAt: number };
-
-  if (cached && now < cached.expiresAt) return cached.value;
-
-  const headers = getRapidHeaders();
-
-  // Some variants are happier with pagination params
-  const url = "https://exercisedb.p.rapidapi.com/exercises?limit=1500&offset=0";
-
-  const res = await fetch(url, {
-    method: "GET",
-    headers,
-    cache: "no-store",
-  });
-
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    console.log("[ExerciseDB] all exercises fetch failed", {
-      status: res.status,
-      body: txt.slice(0, 200),
-    });
-    return null;
-  }
-
-  const data = (await res.json().catch(() => null)) as Exercise[] | null;
-  if (!Array.isArray(data) || data.length === 0) return null;
-
-  g.__exerciseAllCache = { value: data, expiresAt: now + ALL_TTL_MS };
-  return data;
+  return {
+    ok: res.ok,
+    status: res.status,
+    json,
+    text,
+  };
 }
 
 /**
- * fetchByName:
- * - try name endpoint first (fast)
- * - if that fails: fuzzy match inside full list (robust for AI names)
+ * Name endpoint lookup (fast path)
  */
-async function fetchByName(query: string): Promise<Exercise | null> {
+async function fetchByNameOnce(query: string) {
   const q = normName(query);
-  if (!q) return null;
+  if (!q) return { ex: null as Exercise | null, dbg: { step: "bad-query" } };
 
-  // 1) primary: name endpoint
-  const primary = await fetchByNameOnce(q);
-  if (primary) return primary;
+  const url =
+    `https://exercisedb.p.rapidapi.com/exercises/name/` +
+    encodeURIComponent(q) +
+    `?limit=10&offset=0`;
 
-  // 2) cheap prefix fallbacks
-  const tryBarbell = await fetchByNameOnce(`barbell ${q}`);
-  if (tryBarbell) return tryBarbell;
+  const r = await fetchJson(url);
 
-  const tryDumbbell = await fetchByNameOnce(`dumbbell ${q}`);
-  if (tryDumbbell) return tryDumbbell;
+  if (!r.ok) {
+    return {
+      ex: null,
+      dbg: {
+        step: "name-fail",
+        query: q,
+        status: r.status,
+        snippet: (r.text ?? JSON.stringify(r.json) ?? "").slice(0, 200),
+      },
+    };
+  }
 
-  // 3) robust fallback: full list + fuzzy match
-  const all = await fetchAllExercises();
-  if (!all) return null;
+  const data = r.json as Exercise[] | null;
+  if (!Array.isArray(data) || data.length === 0) {
+    return {
+      ex: null,
+      dbg: { step: "name-empty", query: q, status: r.status },
+    };
+  }
 
   const lower = q;
 
-  const exact = all.find(
-    (x) => String(x?.name ?? "").toLowerCase().trim() === lower
+  const exact = data.find(
+    (x) => normName(x?.name) === lower
   );
-  if (exact) return exact;
+  if (exact) return { ex: exact, dbg: { step: "name-exact", query: q } };
 
-  const includes = all.find((x) =>
-    String(x?.name ?? "").toLowerCase().includes(lower)
-  );
-  if (includes) return includes;
-
-  const reverse = all.find((x) =>
-    lower.includes(String(x?.name ?? "").toLowerCase().trim())
+  // prefer common equipment
+  const preferred = data.find((x) =>
+    ["barbell", "dumbbell", "machine", "body weight"].includes(
+      normName(x?.equipment ?? "")
+    )
   );
 
-  return reverse ?? null;
+  return {
+    ex: preferred ?? data[0] ?? null,
+    dbg: { step: "name-picked", query: q, count: data.length },
+  };
+}
+
+/**
+ * ✅ FULL LIST (paged)
+ * Rapid’s /exercises usually defaults to 10 → MUST page.
+ */
+async function fetchAllExercisesPaged(): Promise<{ list: Exercise[] | null; dbg: any }> {
+  const now = Date.now();
+  const cached = g.__exerciseAllCache as null | { value: Exercise[]; expiresAt: number };
+  if (cached && now < cached.expiresAt) {
+    return { list: cached.value, dbg: { step: "all-cache", count: cached.value.length } };
+  }
+
+  const limit = 200;
+  let offset = 0;
+  const all: Exercise[] = [];
+
+  // hard safety cap
+  const MAX_PAGES = 20; // 20*200 = 4000
+
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const url = `https://exercisedb.p.rapidapi.com/exercises?limit=${limit}&offset=${offset}`;
+    const r = await fetchJson(url);
+
+    if (!r.ok) {
+      return {
+        list: null,
+        dbg: {
+          step: "all-fail",
+          status: r.status,
+          offset,
+          snippet: (r.text ?? JSON.stringify(r.json) ?? "").slice(0, 200),
+        },
+      };
+    }
+
+    const batch = r.json as Exercise[] | null;
+    if (!Array.isArray(batch) || batch.length === 0) break;
+
+    all.push(...batch);
+
+    if (batch.length < limit) break;
+    offset += limit;
+  }
+
+  if (all.length === 0) return { list: null, dbg: { step: "all-empty" } };
+
+  g.__exerciseAllCache = { value: all, expiresAt: now + ALL_TTL_MS };
+  return { list: all, dbg: { step: "all-ok", count: all.length } };
+}
+
+/**
+ * Better fuzzy match:
+ * Score by:
+ * - exact token overlap
+ * - query included in name
+ * - small bonus for barbell/dumbbell if query generic
+ */
+function scoreMatch(query: string, exName: string) {
+  const q = normName(query);
+  const n = normName(exName);
+  if (!q || !n) return -1;
+
+  if (n === q) return 999;
+
+  const qTokens = q.split(" ").filter(Boolean);
+  const nTokens = n.split(" ").filter(Boolean);
+
+  let overlap = 0;
+  for (const t of qTokens) {
+    if (nTokens.includes(t)) overlap++;
+  }
+
+  let score = overlap * 10;
+
+  if (n.includes(q)) score += 25; // query substring in name
+  if (qTokens.length > 0) score += Math.round((overlap / qTokens.length) * 10);
+
+  // If query is generic, prefer barbell/dumbbell variants
+  const generic = ["press", "curl", "row", "squat", "deadlift"].some((k) =>
+    qTokens.includes(k)
+  );
+  if (generic) {
+    if (n.startsWith("barbell ")) score += 6;
+    if (n.startsWith("dumbbell ")) score += 4;
+  }
+
+  // slight penalty for very long names when query is short
+  if (qTokens.length <= 2 && nTokens.length >= 5) score -= 3;
+
+  return score;
+}
+
+async function fetchByName(query: string) {
+  const q = normName(query);
+  if (!q) return { ex: null as Exercise | null, dbg: { step: "bad-query" } };
+
+  // 1) name endpoint first
+  const primary = await fetchByNameOnce(q);
+  if (primary.ex) return primary;
+
+  // 2) small prefix fallbacks
+  const tryBarbell = await fetchByNameOnce(`barbell ${q}`);
+  if (tryBarbell.ex) return { ex: tryBarbell.ex, dbg: { step: "prefix-barbell", from: primary.dbg } };
+
+  const tryDumbbell = await fetchByNameOnce(`dumbbell ${q}`);
+  if (tryDumbbell.ex) return { ex: tryDumbbell.ex, dbg: { step: "prefix-dumbbell", from: primary.dbg } };
+
+  // 3) full list + scoring
+  const allRes = await fetchAllExercisesPaged();
+  if (!allRes.list) {
+    return { ex: null, dbg: { step: "all-unavailable", primary: primary.dbg, all: allRes.dbg } };
+  }
+
+  const all = allRes.list;
+
+  let best: Exercise | null = null;
+  let bestScore = -1;
+
+  for (const ex of all) {
+    const s = scoreMatch(q, ex.name);
+    if (s > bestScore) {
+      bestScore = s;
+      best = ex;
+    }
+  }
+
+  // if best score is too low, treat as not found
+  if (!best || bestScore < 8) {
+    return { ex: null, dbg: { step: "all-none", count: all.length, tried: q, bestScore } };
+  }
+
+  return {
+    ex: best,
+    dbg: { step: "all-scored", count: all.length, tried: q, bestScore, bestName: best.name },
+  };
 }
 
 export async function POST(req: Request) {
@@ -190,6 +279,9 @@ export async function POST(req: Request) {
     const rawNames: string[] = Array.isArray(body?.names)
       ? body.names.filter((x: any) => typeof x === "string")
       : [];
+
+    const debug = Boolean(body?.debug);
+    const refresh = Boolean(body?.refresh);
 
     if (rawNames.length === 0) {
       return NextResponse.json(
@@ -207,8 +299,8 @@ export async function POST(req: Request) {
     }
 
     const results: Record<string, any> = {};
+    const debugInfo: Record<string, any> = {};
 
-    // keep RapidAPI happy
     const CONCURRENCY = 3;
     let cursor = 0;
 
@@ -218,22 +310,26 @@ export async function POST(req: Request) {
         const key = uniqueKeys[idx];
         const originalName = keyToOriginal.get(key) ?? key;
 
-        const cached = cacheGet(key);
-        if (cached !== undefined) {
-          results[originalName] = cached;
-          continue;
+        if (!refresh) {
+          const cached = cacheGet(key);
+          if (cached !== undefined) {
+            results[originalName] = cached;
+            if (debug) debugInfo[originalName] = { step: "cache-hit" };
+            continue;
+          }
         }
 
-        const ex = await fetchByName(key);
+        const r = await fetchByName(key);
+        const ex = r.ex;
+
         if (!ex) {
-          cacheSet(key, null);
+          if (!debug) cacheSet(key, null);
           results[originalName] = null;
+          if (debug) debugInfo[originalName] = r.dbg;
           continue;
         }
 
-        const imageUrl = `/api/exercises/image?exerciseId=${encodeURIComponent(
-          ex.id
-        )}&resolution=180`;
+        const imageUrl = `/api/exercises/image?exerciseId=${encodeURIComponent(ex.id)}&resolution=180`;
 
         const shaped = {
           id: ex.id,
@@ -248,15 +344,17 @@ export async function POST(req: Request) {
 
         cacheSet(key, shaped);
         results[originalName] = shaped;
+        if (debug) debugInfo[originalName] = r.dbg;
       }
     }
 
-  await Promise.all(
-  Array.from({ length: CONCURRENCY }, () => worker())
-);
+    await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
 
-
-    return NextResponse.json({ ok: true, results });
+    return NextResponse.json(
+      debug
+        ? { ok: true, version: VERSION, results, debug: debugInfo }
+        : { ok: true, version: VERSION, results }
+    );
   } catch (e: any) {
     return NextResponse.json(
       { ok: false, error: e?.message ?? "Unknown error" },
