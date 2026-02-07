@@ -20,12 +20,23 @@ async function fetchImage(exerciseId: string, resolution: string) {
   return fetch(url, { headers: getHeaders(), cache: "no-store" });
 }
 
-// ✅ PNG placeholder (expo-image safe). 1x1 transparant.
+// ✅ PNG placeholder (RN/expo safe). 1x1 transparent.
 function placeholderPng() {
   return Buffer.from(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=",
     "base64"
   );
+}
+
+function placeholderPngResponse(cacheControl = "public, max-age=86400, s-maxage=86400") {
+  const png = placeholderPng();
+  return new NextResponse(png, {
+    status: 200,
+    headers: {
+      "Content-Type": "image/png",
+      "Cache-Control": cacheControl,
+    },
+  });
 }
 
 export async function GET(req: Request) {
@@ -35,6 +46,7 @@ export async function GET(req: Request) {
     const requestedRes = searchParams.get("resolution") ?? "180";
 
     if (!exerciseId) {
+      // keep as JSON for debugging API misuse
       return NextResponse.json(
         { ok: false, error: "Missing exerciseId" },
         { status: 400 }
@@ -57,27 +69,13 @@ export async function GET(req: Request) {
 
     // 3) if still no image/body -> PNG placeholder (NO 404)
     if (!upstream.ok || !upstream.body) {
-      const png = placeholderPng();
-      return new NextResponse(png, {
-        status: 200,
-        headers: {
-          "Content-Type": "image/png",
-          "Cache-Control": "public, max-age=86400, s-maxage=86400",
-        },
-      });
+      return placeholderPngResponse();
     }
 
     // 4) only pass through if it's actually an image
     const contentType = upstream.headers.get("content-type") ?? "";
     if (!contentType.startsWith("image/")) {
-      const png = placeholderPng();
-      return new NextResponse(png, {
-        status: 200,
-        headers: {
-          "Content-Type": "image/png",
-          "Cache-Control": "public, max-age=86400, s-maxage=86400",
-        },
-      });
+      return placeholderPngResponse();
     }
 
     return new NextResponse(upstream.body, {
@@ -89,13 +87,6 @@ export async function GET(req: Request) {
     });
   } catch {
     // ✅ also return PNG placeholder on errors
-    const png = placeholderPng();
-    return new NextResponse(png, {
-      status: 200,
-      headers: {
-        "Content-Type": "image/png",
-        "Cache-Control": "no-store",
-      },
-    });
+    return placeholderPngResponse("no-store");
   }
 }
