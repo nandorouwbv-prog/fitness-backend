@@ -26,13 +26,44 @@ g.__exerciseAllCache ??= null as null | { value: Exercise[]; expiresAt: number }
 const TTL_MS = 1000 * 60 * 60 * 24; // 24h
 const ALL_TTL_MS = 1000 * 60 * 60 * 6; // 6h
 
-const VERSION = "bulk-v6-hardfilter+scoreMatchEx";
+const VERSION = "bulk-v7-canonicalQuery+hardfilter+scoreMatchEx";
 
 function normName(s: string) {
   return String(s ?? "")
     .trim()
     .toLowerCase()
     .replace(/\s+/g, " ");
+}
+
+/**
+ * ✅ Canonicalize plan exercise names → ExerciseDB-friendly queries
+ * This boosts hit rate and reduces wrong matches.
+ */
+function canonicalQuery(raw: string) {
+  const q = normName(raw);
+
+  const map: Record<string, string> = {
+    // curls
+    "dumbbell bicep curl": "dumbbell curl",
+    "dumbbell biceps curl": "dumbbell curl",
+    "bicep curl": "dumbbell curl", // safer default for common plans
+    "hammer curl": "dumbbell hammer curl",
+
+    // pushups
+    "push up": "push-up",
+    "pushup": "push-up",
+
+    // deadlift variants
+    "deadlift ( light weight )": "deadlift",
+    "deadlift (light weight)": "deadlift",
+    "deadlift light weight": "deadlift",
+    "light weight deadlift": "deadlift",
+
+    // common wording variants
+    "lat pulldown": "lat pulldown",
+  };
+
+  return map[q] ?? q;
 }
 
 function cacheGet(key: string) {
@@ -103,7 +134,8 @@ function scoreMatchEx(query: string, ex: Exercise) {
   let score = overlap * 12;
 
   if (n.includes(q)) score += 25;
-  if (qTokens.length > 0) score += Math.round((overlap / qTokens.length) * 12);
+  if (qTokens.length > 0)
+    score += Math.round((overlap / qTokens.length) * 12);
 
   // HARD query hints → equipment/target sanity
   const wantsDumbbell = qTokens.includes("dumbbell");
@@ -120,7 +152,6 @@ function scoreMatchEx(query: string, ex: Exercise) {
 
   if (wantsBiceps) score += target.includes("biceps") ? 25 : -15;
 
-  // slight penalty for very long names when query is short
   if (qTokens.length <= 2 && nTokens.length >= 5) score -= 3;
 
   return score;
@@ -130,7 +161,7 @@ function scoreMatchEx(query: string, ex: Exercise) {
  * Name endpoint lookup (fast path)
  */
 async function fetchByNameOnce(query: string) {
-  const q = normName(query);
+  const q = canonicalQuery(query);
   if (!q) return { ex: null as Exercise | null, dbg: { step: "bad-query" } };
 
   const url =
@@ -219,7 +250,6 @@ async function fetchByNameOnce(query: string) {
     }
   }
 
-  // If score is very low, treat as not found
   if (!best || bestScore < 8) {
     return {
       ex: null,
@@ -250,7 +280,6 @@ async function fetchByNameOnce(query: string) {
 
 /**
  * ✅ FULL LIST (paged)
- * Rapid’s /exercises usually defaults to 10 → MUST page.
  */
 async function fetchAllExercisesPaged(): Promise<{
   list: Exercise[] | null;
@@ -272,8 +301,7 @@ async function fetchAllExercisesPaged(): Promise<{
   let offset = 0;
   const all: Exercise[] = [];
 
-  // hard safety cap
-  const MAX_PAGES = 20; // 20*200 = 4000
+  const MAX_PAGES = 20;
 
   for (let page = 0; page < MAX_PAGES; page++) {
     const url = `https://exercisedb.p.rapidapi.com/exercises?limit=${limit}&offset=${offset}`;
@@ -307,29 +335,20 @@ async function fetchAllExercisesPaged(): Promise<{
 }
 
 async function fetchByName(query: string) {
-  const q = normName(query);
+  const q = canonicalQuery(query);
   if (!q) return { ex: null as Exercise | null, dbg: { step: "bad-query" } };
 
-  // 1) name endpoint first
   const primary = await fetchByNameOnce(q);
   if (primary.ex) return primary;
 
-  // 2) small prefix fallbacks
   const tryBarbell = await fetchByNameOnce(`barbell ${q}`);
   if (tryBarbell.ex)
-    return {
-      ex: tryBarbell.ex,
-      dbg: { step: "prefix-barbell", from: primary.dbg },
-    };
+    return { ex: tryBarbell.ex, dbg: { step: "prefix-barbell", from: primary.dbg } };
 
   const tryDumbbell = await fetchByNameOnce(`dumbbell ${q}`);
   if (tryDumbbell.ex)
-    return {
-      ex: tryDumbbell.ex,
-      dbg: { step: "prefix-dumbbell", from: primary.dbg },
-    };
+    return { ex: tryDumbbell.ex, dbg: { step: "prefix-dumbbell", from: primary.dbg } };
 
-  // 3) full list + scoring
   const allRes = await fetchAllExercisesPaged();
   if (!allRes.list) {
     return {
@@ -390,9 +409,7 @@ export async function POST(req: Request) {
       );
     }
 
-    const uniqueKeys = Array.from(new Set(rawNames.map(normName))).filter(
-      Boolean
-    );
+    const uniqueKeys = Array.from(new Set(rawNames.map(normName))).filter(Boolean);
 
     const keyToOriginal = new Map<string, string>();
     for (const n of rawNames) {
