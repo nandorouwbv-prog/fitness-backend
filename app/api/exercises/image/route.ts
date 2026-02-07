@@ -35,12 +35,13 @@ export async function GET(req: Request) {
     );
   }
 
-  // 1️⃣ probeer gevraagde resolutie (meestal 180)
+  // 1) try requested resolution first
   let upstream = await fetchImage(exerciseId, resolution);
 
-  // 2️⃣ fallback resoluties (cruciaal voor push-ups & deadlifts)
+  // 2) fallback resolutions (many ids don't have 180)
   if (!upstream.ok) {
-    for (const r of ["360", "90"]) {
+    for (const r of ["360", "90", "180"]) {
+      if (r === resolution) continue;
       const attempt = await fetchImage(exerciseId, r);
       if (attempt.ok) {
         upstream = attempt;
@@ -49,10 +50,14 @@ export async function GET(req: Request) {
     }
   }
 
-  // 3️⃣ als er écht geen image bestaat
   if (!upstream.ok || !upstream.body) {
+    const snippet = await upstream.text().catch(() => "");
     return NextResponse.json(
-      { ok: false, error: "Image not available" },
+      {
+        ok: false,
+        error: `Image not available (${upstream.status})`,
+        snippet: snippet.slice(0, 120),
+      },
       { status: 404 }
     );
   }

@@ -63,6 +63,13 @@ function canonicalQuery(raw: string) {
 
     // common wording variants
     "lat pulldown": "lat pulldown",
+"push-ups": "push-up",
+"push ups": "push-up",
+
+"deadlifts": "deadlift",
+"deadlifts (light weight)": "deadlift",
+"deadlifts ( light weight )": "deadlift",
+
 
     
   };
