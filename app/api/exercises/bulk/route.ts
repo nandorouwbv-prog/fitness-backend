@@ -118,22 +118,41 @@ async function fetchByNameOnce(query: string) {
 
   const lower = q;
 
-  const exact = data.find(
-    (x) => normName(x?.name) === lower
-  );
-  if (exact) return { ex: exact, dbg: { step: "name-exact", query: q } };
+const exact = data.find((x) => normName(x?.name) === lower);
+if (exact) return { ex: exact, dbg: { step: "name-exact", query: q } };
 
-  // prefer common equipment
-  const preferred = data.find((x) =>
-    ["barbell", "dumbbell", "machine", "body weight"].includes(
-      normName(x?.equipment ?? "")
-    )
-  );
+// ✅ pick best match by score (prevents wrong exerciseIds/images)
+let best: Exercise | null = null;
+let bestScore = -1;
 
+for (const ex of data) {
+  const s = scoreMatch(q, ex.name);
+  if (s > bestScore) {
+    bestScore = s;
+    best = ex;
+  }
+}
+
+// If score is very low, treat as not found
+if (!best || bestScore < 8) {
   return {
-    ex: preferred ?? data[0] ?? null,
-    dbg: { step: "name-picked", query: q, count: data.length },
+    ex: null,
+    dbg: { step: "name-scored-none", query: q, count: data.length, bestScore },
   };
+}
+
+return {
+  ex: best,
+  dbg: {
+    step: "name-scored",
+    query: q,
+    count: data.length,
+    bestScore,
+    bestName: best.name,
+    bestEquipment: best.equipment,
+  },
+};
+
 }
 
 /**
