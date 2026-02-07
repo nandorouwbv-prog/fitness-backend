@@ -26,7 +26,7 @@ g.__exerciseAllCache ??= null as null | { value: Exercise[]; expiresAt: number }
 const TTL_MS = 1000 * 60 * 60 * 24; // 24h
 const ALL_TTL_MS = 1000 * 60 * 60 * 6; // 6h
 
-const VERSION = "bulk-v7-canonicalQuery+hardfilter+scoreMatchEx";
+const VERSION = "bulk-v8-canonicalQuery+hardfilter+scoreMatchEx+imagePick";
 
 function normName(s: string) {
   return String(s ?? "")
@@ -43,35 +43,31 @@ function canonicalQuery(raw: string) {
   const q = normName(raw);
 
   const map: Record<string, string> = {
-// curls
-"dumbbell bicep curl": "dumbbell curl",
-"dumbbell biceps curl": "dumbbell curl",
-"bicep curl": "dumbbell curl",
-"hammer curl": "dumbbell hammer curl",
+    // curls
+    "dumbbell bicep curl": "dumbbell curl",
+    "dumbbell biceps curl": "dumbbell curl",
+    "bicep curl": "dumbbell curl",
+    "hammer curl": "dumbbell hammer curl",
 
-// push-ups
-"push-up": "push-up",
-"push up": "push-up",
-"pushup": "push-up",
-"bodyweight push up": "push-up",
+    // push-ups
+    "push-up": "push-up",
+    "push up": "push-up",
+    pushup: "push-up",
+    "bodyweight push up": "push-up",
+    "push-ups": "push-up",
+    "push ups": "push-up",
 
-// deadlift light variants
-"deadlift ( light weight )": "deadlift",
-"deadlift (light weight)": "deadlift",
-"deadlift light weight": "deadlift",
-"light weight deadlift": "deadlift",
+    // deadlift light variants
+    "deadlift ( light weight )": "deadlift",
+    "deadlift (light weight)": "deadlift",
+    "deadlift light weight": "deadlift",
+    "light weight deadlift": "deadlift",
+    deadlifts: "deadlift",
+    "deadlifts (light weight)": "deadlift",
+    "deadlifts ( light weight )": "deadlift",
 
     // common wording variants
     "lat pulldown": "lat pulldown",
-"push-ups": "push-up",
-"push ups": "push-up",
-
-"deadlifts": "deadlift",
-"deadlifts (light weight)": "deadlift",
-"deadlifts ( light weight )": "deadlift",
-
-
-    
   };
 
   return map[q] ?? q;
@@ -145,8 +141,7 @@ function scoreMatchEx(query: string, ex: Exercise) {
   let score = overlap * 12;
 
   if (n.includes(q)) score += 25;
-  if (qTokens.length > 0)
-    score += Math.round((overlap / qTokens.length) * 12);
+  if (qTokens.length > 0) score += Math.round((overlap / qTokens.length) * 12);
 
   // HARD query hints → equipment/target sanity
   const wantsDumbbell = qTokens.includes("dumbbell");
@@ -166,6 +161,73 @@ function scoreMatchEx(query: string, ex: Exercise) {
   if (qTokens.length <= 2 && nTokens.length >= 5) score -= 3;
 
   return score;
+}
+
+/* -------------------------------------------------------
+   ✅ NEW: pick exercise that actually has an image
+-------------------------------------------------------- */
+// image availability cache (per instance)
+type ImgCacheEntry = { ok: boolean; expiresAt: number };
+g.__exerciseImgCache ??= new Map<string, ImgCacheEntry>();
+const imgCache: Map<string, ImgCacheEntry> = g.__exerciseImgCache;
+
+const IMG_TTL_MS = 1000 * 60 * 60 * 24; // 24h
+
+function imgCacheGet(id: string) {
+  const hit = imgCache.get(id);
+  if (!hit) return undefined;
+  if (Date.now() > hit.expiresAt) {
+    imgCache.delete(id);
+    return undefined;
+  }
+  return hit.ok;
+}
+
+function imgCacheSet(id: string, ok: boolean) {
+  imgCache.set(id, { ok, expiresAt: Date.now() + IMG_TTL_MS });
+}
+
+async function hasAnyImage(exerciseId: string) {
+  const cached = imgCacheGet(exerciseId);
+  if (cached !== undefined) return cached;
+
+  const headers = {
+    ...getHeaders(),
+    Accept: "image/*",
+  };
+
+  const base = "https://exercisedb.p.rapidapi.com/image?exerciseId=";
+
+  // try common resolutions (many ids don't have 180)
+  for (const res of ["180", "360", "90"]) {
+    const url = `${base}${encodeURIComponent(exerciseId)}&resolution=${res}`;
+    const r = await fetch(url, { headers, cache: "no-store" });
+    if (r.ok) {
+      imgCacheSet(exerciseId, true);
+      return true;
+    }
+  }
+
+  imgCacheSet(exerciseId, false);
+  return false;
+}
+
+async function pickBestWithImage(query: string, candidates: Exercise[]) {
+  const scored = candidates
+    .map((ex) => ({ ex, score: scoreMatchEx(query, ex) }))
+    .sort((a, b) => b.score - a.score);
+
+  const TOP_N = 6; // small but effective
+
+  for (const item of scored.slice(0, TOP_N)) {
+    if (item.score < 8) break;
+    if (await hasAnyImage(item.ex.id)) return item.ex;
+  }
+
+  // fallback: return best even if no image (keeps details)
+  const best = scored[0];
+  if (!best || best.score < 8) return null;
+  return best.ex;
 }
 
 /**
@@ -205,7 +267,12 @@ async function fetchByNameOnce(query: string) {
   const lower = q;
 
   const exact = data.find((x) => normName(x?.name) === lower);
-  if (exact) return { ex: exact, dbg: { step: "name-exact", query: q } };
+  if (exact) {
+    // even exact might not have an image; prefer exact, but if no image pick another with image
+    const exactHas = await hasAnyImage(exact.id);
+    if (exactHas) return { ex: exact, dbg: { step: "name-exact", query: q } };
+    // fallthrough to image picking
+  }
 
   // ✅ HARD FILTERS: if query mentions equipment/target, prefer matching subset (if available)
   const qTokens = lower.split(" ").filter(Boolean);
@@ -249,19 +316,10 @@ async function fetchByNameOnce(query: string) {
     if (filtered.length > 0) data = filtered;
   }
 
-  // ✅ pick best match by score
-  let best: Exercise | null = null;
-  let bestScore = -1;
+  // ✅ pick best match by score BUT prefer one that has image
+  const best = await pickBestWithImage(q, data);
 
-  for (const ex of data) {
-    const s = scoreMatchEx(q, ex);
-    if (s > bestScore) {
-      bestScore = s;
-      best = ex;
-    }
-  }
-
-  if (!best || bestScore < 8) {
+  if (!best) {
     return {
       ex: null,
       dbg: {
@@ -269,7 +327,6 @@ async function fetchByNameOnce(query: string) {
         query: q,
         count: data.length,
         origCount,
-        bestScore,
       },
     };
   }
@@ -277,14 +334,14 @@ async function fetchByNameOnce(query: string) {
   return {
     ex: best,
     dbg: {
-      step: "name-scored",
+      step: "name-picked-with-image",
       query: q,
       count: data.length,
       origCount,
-      bestScore,
       bestName: best.name,
       bestEquipment: best.equipment,
       bestTarget: best.target,
+      bestId: best.id,
     },
   };
 }
@@ -351,61 +408,38 @@ async function fetchByName(query: string) {
 
   const primary = await fetchByNameOnce(q);
   if (primary.ex) return primary;
-  // ✅ Force correct push-up (avoid "clock push-up")
-if (q === "push up") {
-  const direct = await fetchByNameOnce("push-up");
-  if (direct.ex && normName(direct.ex.name) === "push-up") {
-    return { ex: direct.ex, dbg: { step: "pushup-exact" } };
+
+  // ✅ push-up forced variants (if API doesn't have clean push-up)
+  if (q === "push-up") {
+    const male = await fetchByNameOnce("push-up (male)");
+    if (male.ex) return { ex: male.ex, dbg: { step: "pushup-male-forced" } };
+
+    const female = await fetchByNameOnce("push-up (female)");
+    if (female.ex) return { ex: female.ex, dbg: { step: "pushup-female-forced" } };
+
+    const bodyweight = await fetchByNameOnce("bodyweight push-up");
+    if (bodyweight.ex) return { ex: bodyweight.ex, dbg: { step: "pushup-bodyweight" } };
   }
 
-  const space = await fetchByNameOnce("push up");
-  if (space.ex && normName(space.ex.name) === "push up") {
-    return { ex: space.ex, dbg: { step: "pushup-space-exact" } };
+  // ✅ deadlift fallback
+  if (q === "deadlift") {
+    const dl = await fetchByNameOnce("barbell deadlift");
+    if (dl.ex) return { ex: dl.ex, dbg: { step: "deadlift-barbell" } };
   }
-
-  const male = await fetchByNameOnce("push-up (male)");
-  if (male.ex) return { ex: male.ex, dbg: { step: "pushup-male" } };
-
-  const female = await fetchByNameOnce("push-up (female)");
-  if (female.ex) return { ex: female.ex, dbg: { step: "pushup-female" } };
-}
-
-// ✅ Special fallback for push-ups (ExerciseDB variants)
-// ✅ HARD OVERRIDE for push-up (ExerciseDB has no plain "push-up")
-if (q === "push-up") {
-  const male = await fetchByNameOnce("push-up (male)");
-  if (male.ex) {
-    return { ex: male.ex, dbg: { step: "pushup-male-forced" } };
-  }
-
-  const female = await fetchByNameOnce("push-up (female)");
-  if (female.ex) {
-    return { ex: female.ex, dbg: { step: "pushup-female-forced" } };
-  }
-
-  // absolute last fallback
-  const bodyweight = await fetchByNameOnce("bodyweight push-up");
-  if (bodyweight.ex) {
-    return { ex: bodyweight.ex, dbg: { step: "pushup-bodyweight" } };
-  }
-}
-
-
-// ✅ Deadlift generic fallback
-if (q === "deadlift") {
-  const dl = await fetchByNameOnce("barbell deadlift");
-  if (dl.ex) {
-    return { ex: dl.ex, dbg: { step: "deadlift-barbell" } };
-  }
-}
 
   const tryBarbell = await fetchByNameOnce(`barbell ${q}`);
   if (tryBarbell.ex)
-    return { ex: tryBarbell.ex, dbg: { step: "prefix-barbell", from: primary.dbg } };
+    return {
+      ex: tryBarbell.ex,
+      dbg: { step: "prefix-barbell", from: primary.dbg },
+    };
 
   const tryDumbbell = await fetchByNameOnce(`dumbbell ${q}`);
   if (tryDumbbell.ex)
-    return { ex: tryDumbbell.ex, dbg: { step: "prefix-dumbbell", from: primary.dbg } };
+    return {
+      ex: tryDumbbell.ex,
+      dbg: { step: "prefix-dumbbell", from: primary.dbg },
+    };
 
   const allRes = await fetchAllExercisesPaged();
   if (!allRes.list) {
@@ -417,34 +451,26 @@ if (q === "deadlift") {
 
   const all = allRes.list;
 
-  let best: Exercise | null = null;
-  let bestScore = -1;
+  // ✅ choose best that has an image
+  const best = await pickBestWithImage(q, all);
 
-  for (const ex of all) {
-    const s = scoreMatchEx(q, ex);
-    if (s > bestScore) {
-      bestScore = s;
-      best = ex;
-    }
-  }
-
-  if (!best || bestScore < 8) {
+  if (!best) {
     return {
       ex: null,
-      dbg: { step: "all-none", count: all.length, tried: q, bestScore },
+      dbg: { step: "all-none", count: all.length, tried: q },
     };
   }
 
   return {
     ex: best,
     dbg: {
-      step: "all-scored",
+      step: "all-picked-with-image",
       count: all.length,
       tried: q,
-      bestScore,
       bestName: best.name,
       bestEquipment: best.equipment,
       bestTarget: best.target,
+      bestId: best.id,
     },
   };
 }
