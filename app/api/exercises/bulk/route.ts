@@ -126,7 +126,8 @@ let best: Exercise | null = null;
 let bestScore = -1;
 
 for (const ex of data) {
-  const s = scoreMatch(q, ex.name);
+const s = scoreMatchEx(q, ex);
+
   if (s > bestScore) {
     bestScore = s;
     best = ex;
@@ -211,40 +212,47 @@ async function fetchAllExercisesPaged(): Promise<{ list: Exercise[] | null; dbg:
  * - query included in name
  * - small bonus for barbell/dumbbell if query generic
  */
-function scoreMatch(query: string, exName: string) {
+function scoreMatchEx(query: string, ex: Exercise) {
   const q = normName(query);
-  const n = normName(exName);
-  if (!q || !n) return -1;
+  const n = normName(ex?.name ?? "");
+  const equip = normName(ex?.equipment ?? "");
+  const target = normName(ex?.target ?? "");
 
+  if (!q || !n) return -1;
   if (n === q) return 999;
 
   const qTokens = q.split(" ").filter(Boolean);
   const nTokens = n.split(" ").filter(Boolean);
 
   let overlap = 0;
-  for (const t of qTokens) {
-    if (nTokens.includes(t)) overlap++;
-  }
+  for (const t of qTokens) if (nTokens.includes(t)) overlap++;
 
-  let score = overlap * 10;
+  // base score
+  let score = overlap * 12;
 
-  if (n.includes(q)) score += 25; // query substring in name
-  if (qTokens.length > 0) score += Math.round((overlap / qTokens.length) * 10);
+  if (n.includes(q)) score += 25;
+  if (qTokens.length > 0) score += Math.round((overlap / qTokens.length) * 12);
 
-  // If query is generic, prefer barbell/dumbbell variants
-  const generic = ["press", "curl", "row", "squat", "deadlift"].some((k) =>
-    qTokens.includes(k)
-  );
-  if (generic) {
-    if (n.startsWith("barbell ")) score += 6;
-    if (n.startsWith("dumbbell ")) score += 4;
-  }
+  // ✅ HARD hints from query
+  const wantsDumbbell = qTokens.includes("dumbbell");
+  const wantsBarbell = qTokens.includes("barbell");
+  const wantsCable = qTokens.includes("cable");
+  const wantsMachine = qTokens.includes("machine");
+  const wantsBiceps = qTokens.includes("bicep") || qTokens.includes("biceps");
+
+  if (wantsDumbbell) score += equip.includes("dumbbell") ? 30 : -20;
+  if (wantsBarbell) score += equip.includes("barbell") ? 30 : -20;
+  if (wantsCable) score += equip.includes("cable") ? 30 : -20;
+  if (wantsMachine) score += (equip.includes("machine") || equip.includes("leverage")) ? 25 : -15;
+
+  if (wantsBiceps) score += target.includes("biceps") ? 25 : -15;
 
   // slight penalty for very long names when query is short
   if (qTokens.length <= 2 && nTokens.length >= 5) score -= 3;
 
   return score;
 }
+
 
 async function fetchByName(query: string) {
   const q = normName(query);
@@ -273,7 +281,7 @@ async function fetchByName(query: string) {
   let bestScore = -1;
 
   for (const ex of all) {
-    const s = scoreMatch(q, ex.name);
+  const s = scoreMatchEx(q, ex);
     if (s > bestScore) {
       bestScore = s;
       best = ex;
