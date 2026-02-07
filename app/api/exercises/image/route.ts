@@ -20,16 +20,12 @@ async function fetchImage(exerciseId: string, resolution: string) {
   return fetch(url, { headers: getHeaders(), cache: "no-store" });
 }
 
-// simpele SVG placeholder
-function placeholderSvg(label: string) {
-  const safe = String(label ?? "Exercise").slice(0, 28);
-  return `
-  <svg xmlns="http://www.w3.org/2000/svg" width="180" height="180">
-    <rect width="100%" height="100%" rx="24" ry="24" fill="#EEEEEE"/>
-    <text x="50%" y="52%" dominant-baseline="middle" text-anchor="middle"
-      font-family="Arial" font-size="14" fill="#666666">${safe}</text>
-  </svg>
-  `.trim();
+// ✅ PNG placeholder (expo-image safe). 1x1 transparant.
+function placeholderPng() {
+  return Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=",
+    "base64"
+  );
 }
 
 export async function GET(req: Request) {
@@ -59,26 +55,26 @@ export async function GET(req: Request) {
       }
     }
 
-    // 3) if no body -> placeholder
+    // 3) if still no image/body -> PNG placeholder (NO 404)
     if (!upstream.ok || !upstream.body) {
-      const svg = placeholderSvg(`ID ${exerciseId}`);
-      return new NextResponse(svg, {
+      const png = placeholderPng();
+      return new NextResponse(png, {
         status: 200,
         headers: {
-          "Content-Type": "image/svg+xml",
+          "Content-Type": "image/png",
           "Cache-Control": "public, max-age=86400, s-maxage=86400",
         },
       });
     }
 
-    // 4) IMPORTANT: only pass through if it's really an image
+    // 4) only pass through if it's actually an image
     const contentType = upstream.headers.get("content-type") ?? "";
     if (!contentType.startsWith("image/")) {
-      const svg = placeholderSvg(`ID ${exerciseId}`);
-      return new NextResponse(svg, {
+      const png = placeholderPng();
+      return new NextResponse(png, {
         status: 200,
         headers: {
-          "Content-Type": "image/svg+xml",
+          "Content-Type": "image/png",
           "Cache-Control": "public, max-age=86400, s-maxage=86400",
         },
       });
@@ -92,11 +88,12 @@ export async function GET(req: Request) {
       },
     });
   } catch {
-    const svg = placeholderSvg("No image");
-    return new NextResponse(svg, {
+    // ✅ also return PNG placeholder on errors
+    const png = placeholderPng();
+    return new NextResponse(png, {
       status: 200,
       headers: {
-        "Content-Type": "image/svg+xml",
+        "Content-Type": "image/png",
         "Cache-Control": "no-store",
       },
     });
