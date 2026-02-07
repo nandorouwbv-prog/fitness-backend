@@ -26,7 +26,7 @@ g.__exerciseAllCache ??= null as null | { value: Exercise[]; expiresAt: number }
 const TTL_MS = 1000 * 60 * 60 * 24; // 24h
 const ALL_TTL_MS = 1000 * 60 * 60 * 6; // 6h
 
-const VERSION = "bulk-v5-pagination+scoring";
+const VERSION = "bulk-v6-hardfilter+scoreMatchEx";
 
 function normName(s: string) {
   return String(s ?? "")
@@ -83,6 +83,50 @@ async function fetchJson(url: string) {
 }
 
 /**
+ * Better fuzzy match (uses equipment/target too)
+ */
+function scoreMatchEx(query: string, ex: Exercise) {
+  const q = normName(query);
+  const n = normName(ex?.name ?? "");
+  const equip = normName(ex?.equipment ?? "");
+  const target = normName(ex?.target ?? "");
+
+  if (!q || !n) return -1;
+  if (n === q) return 999;
+
+  const qTokens = q.split(" ").filter(Boolean);
+  const nTokens = n.split(" ").filter(Boolean);
+
+  let overlap = 0;
+  for (const t of qTokens) if (nTokens.includes(t)) overlap++;
+
+  let score = overlap * 12;
+
+  if (n.includes(q)) score += 25;
+  if (qTokens.length > 0) score += Math.round((overlap / qTokens.length) * 12);
+
+  // HARD query hints → equipment/target sanity
+  const wantsDumbbell = qTokens.includes("dumbbell");
+  const wantsBarbell = qTokens.includes("barbell");
+  const wantsCable = qTokens.includes("cable");
+  const wantsMachine = qTokens.includes("machine");
+  const wantsBiceps = qTokens.includes("bicep") || qTokens.includes("biceps");
+
+  if (wantsDumbbell) score += equip.includes("dumbbell") ? 30 : -20;
+  if (wantsBarbell) score += equip.includes("barbell") ? 30 : -20;
+  if (wantsCable) score += equip.includes("cable") ? 30 : -20;
+  if (wantsMachine)
+    score += equip.includes("machine") || equip.includes("leverage") ? 25 : -15;
+
+  if (wantsBiceps) score += target.includes("biceps") ? 25 : -15;
+
+  // slight penalty for very long names when query is short
+  if (qTokens.length <= 2 && nTokens.length >= 5) score -= 3;
+
+  return score;
+}
+
+/**
  * Name endpoint lookup (fast path)
  */
 async function fetchByNameOnce(query: string) {
@@ -108,7 +152,7 @@ async function fetchByNameOnce(query: string) {
     };
   }
 
-  const data = r.json as Exercise[] | null;
+  let data = r.json as Exercise[] | null;
   if (!Array.isArray(data) || data.length === 0) {
     return {
       ex: null,
@@ -118,53 +162,110 @@ async function fetchByNameOnce(query: string) {
 
   const lower = q;
 
-const exact = data.find((x) => normName(x?.name) === lower);
-if (exact) return { ex: exact, dbg: { step: "name-exact", query: q } };
+  const exact = data.find((x) => normName(x?.name) === lower);
+  if (exact) return { ex: exact, dbg: { step: "name-exact", query: q } };
 
-// ✅ pick best match by score (prevents wrong exerciseIds/images)
-let best: Exercise | null = null;
-let bestScore = -1;
+  // ✅ HARD FILTERS: if query mentions equipment/target, prefer matching subset (if available)
+  const qTokens = lower.split(" ").filter(Boolean);
+  const wantsDumbbell = qTokens.includes("dumbbell");
+  const wantsBarbell = qTokens.includes("barbell");
+  const wantsCable = qTokens.includes("cable");
+  const wantsMachine = qTokens.includes("machine");
+  const wantsBiceps = qTokens.includes("bicep") || qTokens.includes("biceps");
 
-for (const ex of data) {
-const s = scoreMatchEx(q, ex);
+  const origCount = data.length;
 
-  if (s > bestScore) {
-    bestScore = s;
-    best = ex;
+  if (wantsDumbbell) {
+    const filtered = data.filter((x) =>
+      normName(x?.equipment ?? "").includes("dumbbell")
+    );
+    if (filtered.length > 0) data = filtered;
   }
-}
+  if (wantsBarbell) {
+    const filtered = data.filter((x) =>
+      normName(x?.equipment ?? "").includes("barbell")
+    );
+    if (filtered.length > 0) data = filtered;
+  }
+  if (wantsCable) {
+    const filtered = data.filter((x) =>
+      normName(x?.equipment ?? "").includes("cable")
+    );
+    if (filtered.length > 0) data = filtered;
+  }
+  if (wantsMachine) {
+    const filtered = data.filter((x) => {
+      const e = normName(x?.equipment ?? "");
+      return e.includes("machine") || e.includes("leverage");
+    });
+    if (filtered.length > 0) data = filtered;
+  }
+  if (wantsBiceps) {
+    const filtered = data.filter((x) =>
+      normName(x?.target ?? "").includes("biceps")
+    );
+    if (filtered.length > 0) data = filtered;
+  }
 
-// If score is very low, treat as not found
-if (!best || bestScore < 8) {
+  // ✅ pick best match by score
+  let best: Exercise | null = null;
+  let bestScore = -1;
+
+  for (const ex of data) {
+    const s = scoreMatchEx(q, ex);
+    if (s > bestScore) {
+      bestScore = s;
+      best = ex;
+    }
+  }
+
+  // If score is very low, treat as not found
+  if (!best || bestScore < 8) {
+    return {
+      ex: null,
+      dbg: {
+        step: "name-scored-none",
+        query: q,
+        count: data.length,
+        origCount,
+        bestScore,
+      },
+    };
+  }
+
   return {
-    ex: null,
-    dbg: { step: "name-scored-none", query: q, count: data.length, bestScore },
+    ex: best,
+    dbg: {
+      step: "name-scored",
+      query: q,
+      count: data.length,
+      origCount,
+      bestScore,
+      bestName: best.name,
+      bestEquipment: best.equipment,
+      bestTarget: best.target,
+    },
   };
-}
-
-return {
-  ex: best,
-  dbg: {
-    step: "name-scored",
-    query: q,
-    count: data.length,
-    bestScore,
-    bestName: best.name,
-    bestEquipment: best.equipment,
-  },
-};
-
 }
 
 /**
  * ✅ FULL LIST (paged)
  * Rapid’s /exercises usually defaults to 10 → MUST page.
  */
-async function fetchAllExercisesPaged(): Promise<{ list: Exercise[] | null; dbg: any }> {
+async function fetchAllExercisesPaged(): Promise<{
+  list: Exercise[] | null;
+  dbg: any;
+}> {
   const now = Date.now();
-  const cached = g.__exerciseAllCache as null | { value: Exercise[]; expiresAt: number };
+  const cached = g.__exerciseAllCache as null | {
+    value: Exercise[];
+    expiresAt: number;
+  };
   if (cached && now < cached.expiresAt) {
-    return { list: cached.value, dbg: { step: "all-cache", count: cached.value.length } };
+    return {
+      list: cached.value,
+      dbg: { step: "all-cache", count: cached.value.length },
+    };
   }
 
   const limit = 200;
@@ -205,55 +306,6 @@ async function fetchAllExercisesPaged(): Promise<{ list: Exercise[] | null; dbg:
   return { list: all, dbg: { step: "all-ok", count: all.length } };
 }
 
-/**
- * Better fuzzy match:
- * Score by:
- * - exact token overlap
- * - query included in name
- * - small bonus for barbell/dumbbell if query generic
- */
-function scoreMatchEx(query: string, ex: Exercise) {
-  const q = normName(query);
-  const n = normName(ex?.name ?? "");
-  const equip = normName(ex?.equipment ?? "");
-  const target = normName(ex?.target ?? "");
-
-  if (!q || !n) return -1;
-  if (n === q) return 999;
-
-  const qTokens = q.split(" ").filter(Boolean);
-  const nTokens = n.split(" ").filter(Boolean);
-
-  let overlap = 0;
-  for (const t of qTokens) if (nTokens.includes(t)) overlap++;
-
-  // base score
-  let score = overlap * 12;
-
-  if (n.includes(q)) score += 25;
-  if (qTokens.length > 0) score += Math.round((overlap / qTokens.length) * 12);
-
-  // ✅ HARD hints from query
-  const wantsDumbbell = qTokens.includes("dumbbell");
-  const wantsBarbell = qTokens.includes("barbell");
-  const wantsCable = qTokens.includes("cable");
-  const wantsMachine = qTokens.includes("machine");
-  const wantsBiceps = qTokens.includes("bicep") || qTokens.includes("biceps");
-
-  if (wantsDumbbell) score += equip.includes("dumbbell") ? 30 : -20;
-  if (wantsBarbell) score += equip.includes("barbell") ? 30 : -20;
-  if (wantsCable) score += equip.includes("cable") ? 30 : -20;
-  if (wantsMachine) score += (equip.includes("machine") || equip.includes("leverage")) ? 25 : -15;
-
-  if (wantsBiceps) score += target.includes("biceps") ? 25 : -15;
-
-  // slight penalty for very long names when query is short
-  if (qTokens.length <= 2 && nTokens.length >= 5) score -= 3;
-
-  return score;
-}
-
-
 async function fetchByName(query: string) {
   const q = normName(query);
   if (!q) return { ex: null as Exercise | null, dbg: { step: "bad-query" } };
@@ -264,15 +316,26 @@ async function fetchByName(query: string) {
 
   // 2) small prefix fallbacks
   const tryBarbell = await fetchByNameOnce(`barbell ${q}`);
-  if (tryBarbell.ex) return { ex: tryBarbell.ex, dbg: { step: "prefix-barbell", from: primary.dbg } };
+  if (tryBarbell.ex)
+    return {
+      ex: tryBarbell.ex,
+      dbg: { step: "prefix-barbell", from: primary.dbg },
+    };
 
   const tryDumbbell = await fetchByNameOnce(`dumbbell ${q}`);
-  if (tryDumbbell.ex) return { ex: tryDumbbell.ex, dbg: { step: "prefix-dumbbell", from: primary.dbg } };
+  if (tryDumbbell.ex)
+    return {
+      ex: tryDumbbell.ex,
+      dbg: { step: "prefix-dumbbell", from: primary.dbg },
+    };
 
   // 3) full list + scoring
   const allRes = await fetchAllExercisesPaged();
   if (!allRes.list) {
-    return { ex: null, dbg: { step: "all-unavailable", primary: primary.dbg, all: allRes.dbg } };
+    return {
+      ex: null,
+      dbg: { step: "all-unavailable", primary: primary.dbg, all: allRes.dbg },
+    };
   }
 
   const all = allRes.list;
@@ -281,21 +344,31 @@ async function fetchByName(query: string) {
   let bestScore = -1;
 
   for (const ex of all) {
-  const s = scoreMatchEx(q, ex);
+    const s = scoreMatchEx(q, ex);
     if (s > bestScore) {
       bestScore = s;
       best = ex;
     }
   }
 
-  // if best score is too low, treat as not found
   if (!best || bestScore < 8) {
-    return { ex: null, dbg: { step: "all-none", count: all.length, tried: q, bestScore } };
+    return {
+      ex: null,
+      dbg: { step: "all-none", count: all.length, tried: q, bestScore },
+    };
   }
 
   return {
     ex: best,
-    dbg: { step: "all-scored", count: all.length, tried: q, bestScore, bestName: best.name },
+    dbg: {
+      step: "all-scored",
+      count: all.length,
+      tried: q,
+      bestScore,
+      bestName: best.name,
+      bestEquipment: best.equipment,
+      bestTarget: best.target,
+    },
   };
 }
 
@@ -317,7 +390,9 @@ export async function POST(req: Request) {
       );
     }
 
-    const uniqueKeys = Array.from(new Set(rawNames.map(normName))).filter(Boolean);
+    const uniqueKeys = Array.from(new Set(rawNames.map(normName))).filter(
+      Boolean
+    );
 
     const keyToOriginal = new Map<string, string>();
     for (const n of rawNames) {
@@ -356,7 +431,9 @@ export async function POST(req: Request) {
           continue;
         }
 
-        const imageUrl = `/api/exercises/image?exerciseId=${encodeURIComponent(ex.id)}&resolution=180`;
+        const imageUrl = `/api/exercises/image?exerciseId=${encodeURIComponent(
+          ex.id
+        )}&resolution=180`;
 
         const shaped = {
           id: ex.id,
