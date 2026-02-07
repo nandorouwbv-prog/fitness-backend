@@ -126,8 +126,19 @@ export async function GET(req: Request) {
       });
     }
 
-    const contentType =
-      upstream.headers.get("content-type") ?? "application/octet-stream";
+  const contentType =
+  upstream.headers.get("content-type") ?? "";
+
+if (!contentType.startsWith("image/")) {
+  const svg = placeholderSvg(`ID ${exerciseId}`);
+  return new NextResponse(svg, {
+    status: 200,
+    headers: {
+      "Content-Type": "image/svg+xml",
+      "Cache-Control": "public, max-age=86400, s-maxage=86400",
+    },
+  });
+}
 
     return new NextResponse(upstream.body, {
       status: 200,
