@@ -26,7 +26,7 @@ g.__exerciseAllCache ??= null as null | { value: Exercise[]; expiresAt: number }
 const TTL_MS = 1000 * 60 * 60 * 24; // 24h
 const ALL_TTL_MS = 1000 * 60 * 60 * 6; // 6h
 
-const VERSION = "bulk-v8-canonicalQuery+hardfilter+scoreMatchEx+imagePick";
+const VERSION = "bulk-v9-bestResolutionPick";
 
 function normName(s: string) {
   return String(s ?? "")
@@ -37,19 +37,16 @@ function normName(s: string) {
 
 /**
  * ✅ Canonicalize plan exercise names → ExerciseDB-friendly queries
- * This boosts hit rate and reduces wrong matches.
  */
 function canonicalQuery(raw: string) {
   const q = normName(raw);
 
   const map: Record<string, string> = {
-    // curls
     "dumbbell bicep curl": "dumbbell curl",
     "dumbbell biceps curl": "dumbbell curl",
     "bicep curl": "dumbbell curl",
     "hammer curl": "dumbbell hammer curl",
 
-    // push-ups
     "push-up": "push-up",
     "push up": "push-up",
     pushup: "push-up",
@@ -57,7 +54,6 @@ function canonicalQuery(raw: string) {
     "push-ups": "push-up",
     "push ups": "push-up",
 
-    // deadlift light variants
     "deadlift ( light weight )": "deadlift",
     "deadlift (light weight)": "deadlift",
     "deadlift light weight": "deadlift",
@@ -66,7 +62,6 @@ function canonicalQuery(raw: string) {
     "deadlifts (light weight)": "deadlift",
     "deadlifts ( light weight )": "deadlift",
 
-    // common wording variants
     "lat pulldown": "lat pulldown",
   };
 
@@ -164,10 +159,11 @@ function scoreMatchEx(query: string, ex: Exercise) {
 }
 
 /* -------------------------------------------------------
-   ✅ NEW: pick exercise that actually has an image
+   ✅ NEW: pick exercise that actually has the BEST image resolution
 -------------------------------------------------------- */
-// image availability cache (per instance)
-type ImgCacheEntry = { ok: boolean; expiresAt: number };
+
+// cache best resolution per exerciseId (per instance)
+type ImgCacheEntry = { res: string | null; expiresAt: number };
 g.__exerciseImgCache ??= new Map<string, ImgCacheEntry>();
 const imgCache: Map<string, ImgCacheEntry> = g.__exerciseImgCache;
 
@@ -180,16 +176,17 @@ function imgCacheGet(id: string) {
     imgCache.delete(id);
     return undefined;
   }
-  return hit.ok;
+  return hit.res;
 }
 
-function imgCacheSet(id: string, ok: boolean) {
-  imgCache.set(id, { ok, expiresAt: Date.now() + IMG_TTL_MS });
+function imgCacheSet(id: string, res: string | null) {
+  imgCache.set(id, { res, expiresAt: Date.now() + IMG_TTL_MS });
 }
 
-async function hasAnyImage(exerciseId: string) {
+/** ✅ Returns best available resolution: "360" | "180" | "90" | null */
+async function getBestImageResolution(exerciseId: string): Promise<string | null> {
   const cached = imgCacheGet(exerciseId);
-  if (cached !== undefined) return cached;
+  if (cached !== undefined) return cached; // can be null
 
   const headers = {
     ...getHeaders(),
@@ -198,18 +195,18 @@ async function hasAnyImage(exerciseId: string) {
 
   const base = "https://exercisedb.p.rapidapi.com/image?exerciseId=";
 
-  // try common resolutions (many ids don't have 180)
-  for (const res of ["180", "360", "90"]) {
+  // ✅ try high → low
+  for (const res of ["360", "180", "90"]) {
     const url = `${base}${encodeURIComponent(exerciseId)}&resolution=${res}`;
     const r = await fetch(url, { headers, cache: "no-store" });
     if (r.ok) {
-      imgCacheSet(exerciseId, true);
-      return true;
+      imgCacheSet(exerciseId, res);
+      return res;
     }
   }
 
-  imgCacheSet(exerciseId, false);
-  return false;
+  imgCacheSet(exerciseId, null);
+  return null;
 }
 
 async function pickBestWithImage(query: string, candidates: Exercise[]) {
@@ -217,17 +214,21 @@ async function pickBestWithImage(query: string, candidates: Exercise[]) {
     .map((ex) => ({ ex, score: scoreMatchEx(query, ex) }))
     .sort((a, b) => b.score - a.score);
 
-  const TOP_N = 6; // small but effective
+  const TOP_N = 6;
 
   for (const item of scored.slice(0, TOP_N)) {
     if (item.score < 8) break;
-    if (await hasAnyImage(item.ex.id)) return item.ex;
+
+    const bestRes = await getBestImageResolution(item.ex.id);
+    if (bestRes) return { ex: item.ex, bestRes };
   }
 
-  // fallback: return best even if no image (keeps details)
+  // fallback: return best even if no image
   const best = scored[0];
   if (!best || best.score < 8) return null;
-  return best.ex;
+
+  const bestRes = await getBestImageResolution(best.ex.id);
+  return { ex: best.ex, bestRes: bestRes ?? null };
 }
 
 /**
@@ -235,7 +236,7 @@ async function pickBestWithImage(query: string, candidates: Exercise[]) {
  */
 async function fetchByNameOnce(query: string) {
   const q = canonicalQuery(query);
-  if (!q) return { ex: null as Exercise | null, dbg: { step: "bad-query" } };
+  if (!q) return { ex: null as Exercise | null, bestRes: null as string | null, dbg: { step: "bad-query" } };
 
   const url =
     `https://exercisedb.p.rapidapi.com/exercises/name/` +
@@ -247,6 +248,7 @@ async function fetchByNameOnce(query: string) {
   if (!r.ok) {
     return {
       ex: null,
+      bestRes: null,
       dbg: {
         step: "name-fail",
         query: q,
@@ -260,21 +262,21 @@ async function fetchByNameOnce(query: string) {
   if (!Array.isArray(data) || data.length === 0) {
     return {
       ex: null,
+      bestRes: null,
       dbg: { step: "name-empty", query: q, status: r.status },
     };
   }
 
   const lower = q;
-
   const exact = data.find((x) => normName(x?.name) === lower);
+
   if (exact) {
-    // even exact might not have an image; prefer exact, but if no image pick another with image
-    const exactHas = await hasAnyImage(exact.id);
-    if (exactHas) return { ex: exact, dbg: { step: "name-exact", query: q } };
-    // fallthrough to image picking
+    const bestRes = await getBestImageResolution(exact.id);
+    if (bestRes) return { ex: exact, bestRes, dbg: { step: "name-exact+bestRes", query: q, bestRes } };
+    // if exact has no image, fallthrough to pick best with image
   }
 
-  // ✅ HARD FILTERS: if query mentions equipment/target, prefer matching subset (if available)
+  // HARD FILTERS
   const qTokens = lower.split(" ").filter(Boolean);
   const wantsDumbbell = qTokens.includes("dumbbell");
   const wantsBarbell = qTokens.includes("barbell");
@@ -285,21 +287,15 @@ async function fetchByNameOnce(query: string) {
   const origCount = data.length;
 
   if (wantsDumbbell) {
-    const filtered = data.filter((x) =>
-      normName(x?.equipment ?? "").includes("dumbbell")
-    );
+    const filtered = data.filter((x) => normName(x?.equipment ?? "").includes("dumbbell"));
     if (filtered.length > 0) data = filtered;
   }
   if (wantsBarbell) {
-    const filtered = data.filter((x) =>
-      normName(x?.equipment ?? "").includes("barbell")
-    );
+    const filtered = data.filter((x) => normName(x?.equipment ?? "").includes("barbell"));
     if (filtered.length > 0) data = filtered;
   }
   if (wantsCable) {
-    const filtered = data.filter((x) =>
-      normName(x?.equipment ?? "").includes("cable")
-    );
+    const filtered = data.filter((x) => normName(x?.equipment ?? "").includes("cable"));
     if (filtered.length > 0) data = filtered;
   }
   if (wantsMachine) {
@@ -310,59 +306,45 @@ async function fetchByNameOnce(query: string) {
     if (filtered.length > 0) data = filtered;
   }
   if (wantsBiceps) {
-    const filtered = data.filter((x) =>
-      normName(x?.target ?? "").includes("biceps")
-    );
+    const filtered = data.filter((x) => normName(x?.target ?? "").includes("biceps"));
     if (filtered.length > 0) data = filtered;
   }
 
-  // ✅ pick best match by score BUT prefer one that has image
-  const best = await pickBestWithImage(q, data);
+  const picked = await pickBestWithImage(q, data);
 
-  if (!best) {
+  if (!picked?.ex) {
     return {
       ex: null,
-      dbg: {
-        step: "name-scored-none",
-        query: q,
-        count: data.length,
-        origCount,
-      },
+      bestRes: null,
+      dbg: { step: "name-scored-none", query: q, count: data.length, origCount },
     };
   }
 
   return {
-    ex: best,
+    ex: picked.ex,
+    bestRes: picked.bestRes,
     dbg: {
-      step: "name-picked-with-image",
+      step: "name-picked+bestRes",
       query: q,
       count: data.length,
       origCount,
-      bestName: best.name,
-      bestEquipment: best.equipment,
-      bestTarget: best.target,
-      bestId: best.id,
+      bestName: picked.ex.name,
+      bestEquipment: picked.ex.equipment,
+      bestTarget: picked.ex.target,
+      bestId: picked.ex.id,
+      bestRes: picked.bestRes,
     },
   };
 }
 
 /**
- * ✅ FULL LIST (paged)
+ * FULL LIST (paged)
  */
-async function fetchAllExercisesPaged(): Promise<{
-  list: Exercise[] | null;
-  dbg: any;
-}> {
+async function fetchAllExercisesPaged(): Promise<{ list: Exercise[] | null; dbg: any }> {
   const now = Date.now();
-  const cached = g.__exerciseAllCache as null | {
-    value: Exercise[];
-    expiresAt: number;
-  };
+  const cached = g.__exerciseAllCache as null | { value: Exercise[]; expiresAt: number };
   if (cached && now < cached.expiresAt) {
-    return {
-      list: cached.value,
-      dbg: { step: "all-cache", count: cached.value.length },
-    };
+    return { list: cached.value, dbg: { step: "all-cache", count: cached.value.length } };
   }
 
   const limit = 200;
@@ -404,73 +386,55 @@ async function fetchAllExercisesPaged(): Promise<{
 
 async function fetchByName(query: string) {
   const q = canonicalQuery(query);
-  if (!q) return { ex: null as Exercise | null, dbg: { step: "bad-query" } };
+  if (!q) return { ex: null as Exercise | null, bestRes: null as string | null, dbg: { step: "bad-query" } };
 
   const primary = await fetchByNameOnce(q);
   if (primary.ex) return primary;
 
-  // ✅ push-up forced variants (if API doesn't have clean push-up)
   if (q === "push-up") {
     const male = await fetchByNameOnce("push-up (male)");
-    if (male.ex) return { ex: male.ex, dbg: { step: "pushup-male-forced" } };
+    if (male.ex) return { ex: male.ex, bestRes: male.bestRes, dbg: { step: "pushup-male-forced" } };
 
     const female = await fetchByNameOnce("push-up (female)");
-    if (female.ex) return { ex: female.ex, dbg: { step: "pushup-female-forced" } };
+    if (female.ex) return { ex: female.ex, bestRes: female.bestRes, dbg: { step: "pushup-female-forced" } };
 
     const bodyweight = await fetchByNameOnce("bodyweight push-up");
-    if (bodyweight.ex) return { ex: bodyweight.ex, dbg: { step: "pushup-bodyweight" } };
+    if (bodyweight.ex) return { ex: bodyweight.ex, bestRes: bodyweight.bestRes, dbg: { step: "pushup-bodyweight" } };
   }
 
-  // ✅ deadlift fallback
   if (q === "deadlift") {
     const dl = await fetchByNameOnce("barbell deadlift");
-    if (dl.ex) return { ex: dl.ex, dbg: { step: "deadlift-barbell" } };
+    if (dl.ex) return { ex: dl.ex, bestRes: dl.bestRes, dbg: { step: "deadlift-barbell" } };
   }
 
   const tryBarbell = await fetchByNameOnce(`barbell ${q}`);
-  if (tryBarbell.ex)
-    return {
-      ex: tryBarbell.ex,
-      dbg: { step: "prefix-barbell", from: primary.dbg },
-    };
+  if (tryBarbell.ex) return { ex: tryBarbell.ex, bestRes: tryBarbell.bestRes, dbg: { step: "prefix-barbell", from: primary.dbg } };
 
   const tryDumbbell = await fetchByNameOnce(`dumbbell ${q}`);
-  if (tryDumbbell.ex)
-    return {
-      ex: tryDumbbell.ex,
-      dbg: { step: "prefix-dumbbell", from: primary.dbg },
-    };
+  if (tryDumbbell.ex) return { ex: tryDumbbell.ex, bestRes: tryDumbbell.bestRes, dbg: { step: "prefix-dumbbell", from: primary.dbg } };
 
   const allRes = await fetchAllExercisesPaged();
   if (!allRes.list) {
-    return {
-      ex: null,
-      dbg: { step: "all-unavailable", primary: primary.dbg, all: allRes.dbg },
-    };
+    return { ex: null, bestRes: null, dbg: { step: "all-unavailable", primary: primary.dbg, all: allRes.dbg } };
   }
 
-  const all = allRes.list;
-
-  // ✅ choose best that has an image
-  const best = await pickBestWithImage(q, all);
-
-  if (!best) {
-    return {
-      ex: null,
-      dbg: { step: "all-none", count: all.length, tried: q },
-    };
+  const picked = await pickBestWithImage(q, allRes.list);
+  if (!picked?.ex) {
+    return { ex: null, bestRes: null, dbg: { step: "all-none", count: allRes.list.length, tried: q } };
   }
 
   return {
-    ex: best,
+    ex: picked.ex,
+    bestRes: picked.bestRes,
     dbg: {
-      step: "all-picked-with-image",
-      count: all.length,
+      step: "all-picked+bestRes",
+      count: allRes.list.length,
       tried: q,
-      bestName: best.name,
-      bestEquipment: best.equipment,
-      bestTarget: best.target,
-      bestId: best.id,
+      bestName: picked.ex.name,
+      bestEquipment: picked.ex.equipment,
+      bestTarget: picked.ex.target,
+      bestId: picked.ex.id,
+      bestRes: picked.bestRes,
     },
   };
 }
@@ -532,9 +496,10 @@ export async function POST(req: Request) {
           continue;
         }
 
-        const imageUrl = `/api/exercises/image?exerciseId=${encodeURIComponent(
-          ex.id
-        )}&resolution=180`;
+        const bestRes = r.bestRes ?? "180"; // fallback if unknown
+        const imageUrl =
+          `/api/exercises/image?exerciseId=${encodeURIComponent(ex.id)}` +
+          `&resolution=${encodeURIComponent(bestRes)}`;
 
         const shaped = {
           id: ex.id,
@@ -544,6 +509,9 @@ export async function POST(req: Request) {
           equipment: ex.equipment,
           difficulty: ex.difficulty,
           category: ex.category,
+
+          // ✅ now best quality
+          bestRes,
           imageUrl,
         };
 
