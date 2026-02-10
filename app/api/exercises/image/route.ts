@@ -20,7 +20,7 @@ async function fetchImage(exerciseId: string, resolution: string) {
   return fetch(url, { headers: getHeaders(), cache: "no-store" });
 }
 
-// ✅ PNG placeholder (RN/expo safe). 1x1 transparent.
+// 1x1 transparent png
 function placeholderPng() {
   return Buffer.from(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=",
@@ -43,40 +43,31 @@ export async function GET(req: Request) {
   try {
     const { searchParams } = new URL(req.url);
     const exerciseId = searchParams.get("exerciseId");
-    const requestedRes = searchParams.get("resolution") ?? "180";
+    const requestedRes = searchParams.get("resolution") ?? "360";
 
     if (!exerciseId) {
-      // keep as JSON for debugging API misuse
-      return NextResponse.json(
-        { ok: false, error: "Missing exerciseId" },
-        { status: 400 }
-      );
+      return NextResponse.json({ ok: false, error: "Missing exerciseId" }, { status: 400 });
     }
 
-    // 1) try requested res
-    let upstream = await fetchImage(exerciseId, requestedRes);
+    // ✅ try requested first, then fallback high→low
+    const attempts = Array.from(
+      new Set([requestedRes, "360", "180", "90"].map(String))
+    );
 
-    // 2) fallback resolutions
-    if (!upstream.ok) {
-      for (const r of ["360", "90"]) {
-        const attempt = await fetchImage(exerciseId, r);
-        if (attempt.ok) {
-          upstream = attempt;
-          break;
-        }
+    let upstream: Response | null = null;
+
+    for (const r of attempts) {
+      const res = await fetchImage(exerciseId, r);
+      if (res.ok && res.body) {
+        upstream = res;
+        break;
       }
     }
 
-    // 3) if still no image/body -> PNG placeholder (NO 404)
-    if (!upstream.ok || !upstream.body) {
-      return placeholderPngResponse();
-    }
+    if (!upstream) return placeholderPngResponse();
 
-    // 4) only pass through if it's actually an image
     const contentType = upstream.headers.get("content-type") ?? "";
-    if (!contentType.startsWith("image/")) {
-      return placeholderPngResponse();
-    }
+    if (!contentType.startsWith("image/")) return placeholderPngResponse();
 
     return new NextResponse(upstream.body, {
       status: 200,
@@ -86,7 +77,6 @@ export async function GET(req: Request) {
       },
     });
   } catch {
-    // ✅ also return PNG placeholder on errors
     return placeholderPngResponse("no-store");
   }
 }
