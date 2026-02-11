@@ -34,25 +34,54 @@ function safeNum(v: any) {
   return Number.isFinite(n) ? n : null;
 }
 
-function fallbackResponse(): CoachAIResponse {
+function pickLanguage(context: any): "en" | "nl" {
+  const raw = String(context?.language ?? context?.lang ?? "").trim().toLowerCase();
+  if (raw.startsWith("nl") || raw.includes("dutch") || raw.includes("neder")) return "nl";
+  return "en";
+}
+
+function fallbackResponse(language: "en" | "nl" = "en"): CoachAIResponse {
+  if (language === "nl") {
+    return {
+      summary:
+        "Sterke check-in. Houd het simpel: consistent trainen, genoeg eiwit/water, en slaap strak houden.",
+      wins: ["Je bent aan het tracken — dat is hoe je wint op lange termijn."],
+      focus: [
+        "Haal je geplande trainingen (of minimaal 2 als het druk is).",
+        "Protein + hydration elke dag.",
+        "Slaap: vaste bedtijd, schermen eerder uit.",
+      ],
+      actions_today: [
+        "Doe je warm-up + je eerste oefening (minimale versie is ook goed).",
+        "Log je sets en houd je rusttijden strak.",
+      ],
+      next_workout_adjustment: {
+        type: "none",
+        details: "Nog geen aanpassingen nodig — focus op consistentie.",
+      },
+      questions: ["Welke oefening voelt nu het meest ‘stuck’ en waarom denk je dat dat zo is?"],
+      safety: { flag: false, message: "" },
+    };
+  }
+
   return {
     summary:
-      "Sterke check-in. Houd het simpel: consistent trainen, genoeg eiwit/water, en slaap strak houden.",
-    wins: ["Je bent aan het tracken — dat is hoe je wint op lange termijn."],
+      "Strong check-in. Keep it simple: train consistently, hit protein + water, and lock in sleep.",
+    wins: ["You’re tracking — that’s how you win long-term."],
     focus: [
-      "Haal je geplande trainingen (of minimaal 2 als het druk is).",
-      "Protein + hydration elke dag.",
-      "Slaap: vaste bedtijd, schermen eerder uit.",
+      "Hit your planned sessions (or at least 2 if life is busy).",
+      "Protein + hydration daily.",
+      "Sleep: consistent bedtime, screens off earlier.",
     ],
     actions_today: [
-      "Doe je warm-up + je eerste oefening (minimale versie is ook goed).",
-      "Log je sets en houd je rusttijden strak.",
+      "Do your warm-up + your first exercise (minimum version still counts).",
+      "Log your sets and keep rest times consistent.",
     ],
     next_workout_adjustment: {
       type: "none",
-      details: "Nog geen aanpassingen nodig — focus op consistentie.",
+      details: "No adjustments yet — focus on consistency.",
     },
-    questions: ["Welke oefening voelt nu het meest ‘stuck’ en waarom denk je dat dat zo is?"],
+    questions: ["Which exercise feels most ‘stuck’ right now, and why do you think that is?"],
     safety: { flag: false, message: "" },
   };
 }
@@ -68,6 +97,8 @@ export async function POST(req: Request) {
     const checkin = body?.checkin ?? {};
     const context = body?.context ?? {};
 
+    const language = pickLanguage(context); // ✅ "en" default
+
     const payload = {
       dateISO: safeStr(checkin?.dateISO, 20),
       weight: safeNum(checkin?.weight),
@@ -81,6 +112,7 @@ export async function POST(req: Request) {
     };
 
     const ctx = {
+      language, // ✅ keep for prompt + debugging
       profileName: safeStr(context?.profileName, 60),
       goal: safeStr(context?.goal, 40),
       fitnessLevel: safeStr(context?.fitnessLevel, 40),
@@ -98,16 +130,17 @@ export async function POST(req: Request) {
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
     const system = `
-Je bent een fitness coach in een mobiele app.
-Je MOET alleen geldige JSON teruggeven (geen markdown, geen extra tekst).
-Wees supportief, helder en kort. Geen medische diagnose.
-Als de user scherpe pijn, gevoelloosheid, duizeligheid, pijn op de borst, of ernstige klachten noemt:
-zet safety.flag=true en adviseer te stoppen en professionele hulp te zoeken.
-Geen illegale middelen aanbevelen.
-Output taal: Nederlands.
+You are a fitness coach inside a mobile app.
+You MUST return ONLY valid JSON (no markdown, no extra text).
+Be supportive, clear, and short. No medical diagnosis.
+If the user mentions sharp pain, numbness, dizziness, chest pain, or severe symptoms:
+set safety.flag=true and advise to stop and seek professional help.
+Do not recommend illegal substances.
+
+Output language: ${language === "nl" ? "Dutch" : "English"}.
 JSON schema:
 {
-  "summary": string (1-2 zinnen),
+  "summary": string (1-2 sentences),
   "wins": string[] (1-3),
   "focus": string[] (2-4),
   "actions_today": string[] (2-4),
@@ -115,7 +148,7 @@ JSON schema:
   "questions": string[] (0-2),
   "safety": { "flag": boolean, "message": string }
 }
-`;
+`.trim();
 
     const user = `
 WEEKLY CHECK-IN DATA:
@@ -124,13 +157,14 @@ ${JSON.stringify(payload)}
 CONTEXT:
 ${JSON.stringify(ctx)}
 
-Taak:
-- Vat de week samen in 1-2 zinnen.
-- Geef wins (1-3), focus (2-4), actions_today (2-4).
-- Geef 1 adjustment suggestie (of none). Houd het veilig.
-- Max 2 vragen alleen als nodig.
+Task:
+- Summarize the week in 1-2 sentences.
+- Provide wins (1-3), focus (2-4), actions_today (2-4).
+- Give ONE adjustment suggestion (or none). Keep it safe.
+- Max 2 questions only if needed.
+Language: ${language === "nl" ? "Dutch" : "English"}.
 Return JSON only.
-`;
+`.trim();
 
     const model = process.env.OPENAI_COACH_MODEL || "gpt-4o-mini";
 
@@ -140,8 +174,8 @@ Return JSON only.
         temperature: 0.4,
         response_format: { type: "json_object" },
         messages: [
-          { role: "system", content: system.trim() },
-          { role: "user", content: user.trim() },
+          { role: "system", content: system },
+          { role: "user", content: user },
         ],
       },
       { signal: ctrl.signal as any }
@@ -157,35 +191,42 @@ Return JSON only.
     }
 
     if (!parsed || typeof parsed !== "object") {
-      return NextResponse.json(fallbackResponse());
+      return NextResponse.json(fallbackResponse(language));
     }
 
+    const fb = fallbackResponse(language);
+
     const out: CoachAIResponse = {
-      summary: safeStr(parsed.summary, 260) || fallbackResponse().summary,
-      wins: Array.isArray(parsed.wins) ? parsed.wins.map((s) => safeStr(s, 120)).filter(Boolean).slice(0, 3) : [],
-      focus: Array.isArray(parsed.focus) ? parsed.focus.map((s) => safeStr(s, 140)).filter(Boolean).slice(0, 4) : [],
-      actions_today: Array.isArray(parsed.actions_today)
-        ? parsed.actions_today.map((s) => safeStr(s, 140)).filter(Boolean).slice(0, 4)
-        : [],
+      summary: safeStr((parsed as any).summary, 260) || fb.summary,
+      wins: Array.isArray((parsed as any).wins)
+        ? (parsed as any).wins.map((s: any) => safeStr(s, 120)).filter(Boolean).slice(0, 3)
+        : fb.wins,
+      focus: Array.isArray((parsed as any).focus)
+        ? (parsed as any).focus.map((s: any) => safeStr(s, 140)).filter(Boolean).slice(0, 4)
+        : fb.focus,
+      actions_today: Array.isArray((parsed as any).actions_today)
+        ? (parsed as any).actions_today.map((s: any) => safeStr(s, 140)).filter(Boolean).slice(0, 4)
+        : fb.actions_today,
       next_workout_adjustment: {
-        type: (parsed.next_workout_adjustment?.type as any) || "none",
+        type: ((parsed as any).next_workout_adjustment?.type as any) || "none",
         details:
-          safeStr(parsed.next_workout_adjustment?.details, 180) ||
-          "Nog geen aanpassingen nodig — focus op consistentie.",
+          safeStr((parsed as any).next_workout_adjustment?.details, 180) ||
+          fb.next_workout_adjustment.details,
       },
-      questions: Array.isArray(parsed.questions)
-        ? parsed.questions.map((s) => safeStr(s, 120)).filter(Boolean).slice(0, 2)
-        : [],
+      questions: Array.isArray((parsed as any).questions)
+        ? (parsed as any).questions.map((s: any) => safeStr(s, 120)).filter(Boolean).slice(0, 2)
+        : fb.questions,
       safety: {
-        flag: !!parsed.safety?.flag,
-        message: safeStr(parsed.safety?.message, 220) || "",
+        flag: !!(parsed as any).safety?.flag,
+        message: safeStr((parsed as any).safety?.message, 220) || "",
       },
     };
 
     return NextResponse.json(out);
   } catch (e: any) {
     // Always return a usable response (no hard fail)
-    return NextResponse.json(fallbackResponse(), { status: 200 });
+    // default to English fallback when unknown
+    return NextResponse.json(fallbackResponse("en"), { status: 200 });
   } finally {
     clearTimeout(t);
   }
