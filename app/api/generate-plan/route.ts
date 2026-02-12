@@ -55,19 +55,21 @@ const DEFAULT_ORDER: Array<z.infer<typeof Weekday>> = [
   "Sunday",
 ];
 
-function buildPrompt(input: z.infer<typeof InputSchema>, trainingDays: string[], daysPerWeek: number) {
+function buildPrompt(
+  input: z.infer<typeof InputSchema>,
+  trainingDays: string[],
+  daysPerWeek: number
+) {
   return `
 You are a professional fitness coach.
-Return JSON ONLY. No markdown. No extra text.
-
 Create a realistic 4-week training plan.
 
 Hard rules:
 - Exactly ${daysPerWeek} sessions per week.
 - Each session.day MUST be exactly one of: ${trainingDays.join(", ")}
 - Each week must include each of those training days exactly once.
-- Each session: day, focus, exercises (4-8 items)
-- Each exercise: name, sets (2-5), reps ("8-12" or number), restSec (45-120)
+- Each session has: day, focus, exercises (4-8)
+- Each exercise has: name, sets (2-5), reps ("8-12" or number), restSec (45-120)
 
 User:
 Goal: ${input.goal}
@@ -77,55 +79,109 @@ Session length: ${input.sessionMinutes} minutes
 Equipment: ${input.equipment.join(", ") || "none"}
 Injuries: ${input.injuries || "none"}
 
-Output must match this exact shape:
-{
-  "goal": string,
-  "experience": string,
-  "days_per_week": number,
-  "training_days": string[],
-  "session_length_minutes": number,
-  "plan": {
-    "weeks": [
-      {
-        "week": 1,
-        "sessions": [
-          {
-            "day": "Monday",
-            "focus": "string",
-            "exercises": [
-              { "name": "string", "sets": 3, "reps": "8-12", "restSec": 60 }
-            ]
-          }
-        ]
-      }
-    ]
-  }
-}
-Weeks 2-4 should be slightly progressive.
+Return ONLY via the function tool call.
 `.trim();
 }
 
-async function createPlanJson(openai: OpenAI, prompt: string, temperature: number) {
+async function runToolPlan(
+  openai: OpenAI,
+  prompt: string,
+  temperature: number
+): Promise<any> {
+  const toolName = "create_training_plan";
+
   const completion = await openai.chat.completions.create({
     model: "gpt-4.1-mini",
     temperature,
-    // keep outputs bounded
-    max_tokens: 1800,
-    response_format: { type: "json_object" },
+    max_tokens: 2200,
     messages: [
-      { role: "system", content: "Return valid JSON only. No markdown. No extra text." },
+      { role: "system", content: "Use the tool to return structured output. No extra text." },
       { role: "user", content: prompt },
     ],
+    tools: [
+      {
+        type: "function",
+        function: {
+          name: toolName,
+          description: "Return a 4-week training plan in a strict JSON structure.",
+          parameters: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              goal: { type: "string" },
+              experience: { type: "string" },
+              days_per_week: { type: "number" },
+              training_days: { type: "array", items: { type: "string" } },
+              session_length_minutes: { type: "number" },
+              plan: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  weeks: {
+                    type: "array",
+                    items: {
+                      type: "object",
+                      additionalProperties: false,
+                      properties: {
+                        week: { type: "number" },
+                        sessions: {
+                          type: "array",
+                          items: {
+                            type: "object",
+                            additionalProperties: false,
+                            properties: {
+                              day: { type: "string" },
+                              focus: { type: "string" },
+                              exercises: {
+                                type: "array",
+                                items: {
+                                  type: "object",
+                                  additionalProperties: false,
+                                  properties: {
+                                    name: { type: "string" },
+                                    sets: { type: "number" },
+                                    reps: { type: "string" },
+                                    restSec: { type: "number" },
+                                  },
+                                  required: ["name", "sets", "reps", "restSec"],
+                                },
+                              },
+                            },
+                            required: ["day", "focus", "exercises"],
+                          },
+                        },
+                      },
+                      required: ["week", "sessions"],
+                    },
+                  },
+                },
+                required: ["weeks"],
+              },
+            },
+            required: [
+              "goal",
+              "experience",
+              "days_per_week",
+              "training_days",
+              "session_length_minutes",
+              "plan",
+            ],
+          },
+        },
+      },
+    ],
+    tool_choice: { type: "function", function: { name: toolName } },
   });
 
-  const content = completion.choices[0]?.message?.content ?? "";
-  // If OpenAI ever returns empty/null (rare) -> fail fast
-  if (!content || !content.trim()) {
-    throw new Error("Empty JSON response from model");
+  const msg = completion.choices?.[0]?.message;
+  const toolCalls = (msg as any)?.tool_calls ?? [];
+  const argsStr = toolCalls?.[0]?.function?.arguments;
+
+  if (!argsStr || typeof argsStr !== "string") {
+    throw new Error("Model did not return tool arguments.");
   }
 
-  // JSON.parse can still fail if the model violated constraints (OpenAI sometimes throws earlier too)
-  return JSON.parse(content);
+  return JSON.parse(argsStr);
 }
 
 export async function POST(req: Request) {
@@ -148,32 +204,17 @@ export async function POST(req: Request) {
     const daysPerWeek = trainingDays.length;
     const prompt = buildPrompt(input, trainingDays, daysPerWeek);
 
-    // ✅ Retry plan: if OpenAI complains about invalid JSON, retry with lower temp
+    // ✅ retry with lower temp if something weird happens
     let parsed: any = null;
-    const attempts = [
-      { t: 0.4 },
-      { t: 0.0 },
-    ];
-
     let lastErr: any = null;
 
-    for (const a of attempts) {
+    for (const t of [0.4, 0.0]) {
       try {
-        parsed = await createPlanJson(openai, prompt, a.t);
+        parsed = await runToolPlan(openai, prompt, t);
         lastErr = null;
         break;
       } catch (e: any) {
-        const msg = String(e?.message ?? "");
         lastErr = e;
-
-        // If it's NOT a JSON-format issue, stop retrying
-        const jsonish =
-          msg.toLowerCase().includes("invalid json") ||
-          msg.toLowerCase().includes("model returned invalid json") ||
-          msg.toLowerCase().includes("json") ||
-          msg.toLowerCase().includes("parse");
-
-        if (!jsonish) break;
       }
     }
 
@@ -185,7 +226,7 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: false, error: message }, { status: 400 });
     }
 
-    // --- Validate output shape a bit
+    // ✅ Hard safety checks: sessions length + required days
     const weeks = parsed?.plan?.weeks;
     if (!Array.isArray(weeks) || weeks.length === 0) {
       return NextResponse.json(
@@ -220,6 +261,7 @@ export async function POST(req: Request) {
       }
     }
 
+    // ✅ normalize top fields (keep consistent)
     const plan = {
       goal: String(parsed?.goal ?? input.goal),
       experience: String(parsed?.experience ?? input.experience),
