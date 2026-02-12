@@ -4,11 +4,6 @@ import { NextResponse } from "next/server";
 
 export const runtime = "nodejs";
 
-// ✅ If you're on Vercel: allows longer serverless execution (plan-dependent)
-export const maxDuration = 120;
-
- // (just to keep TS happy if you edit later)
-
 const Weekday = z.enum([
   "Monday",
   "Tuesday",
@@ -42,7 +37,8 @@ const InputSchema = z
       if (val.trainingDays.length !== val.daysPerWeek) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
-          message: "trainingDays length must match daysPerWeek (or omit trainingDays).",
+          message:
+            "trainingDays length must match daysPerWeek (or omit trainingDays).",
           path: ["trainingDays"],
         });
       }
@@ -59,104 +55,30 @@ const DEFAULT_ORDER: Array<z.infer<typeof Weekday>> = [
   "Sunday",
 ];
 
-/** -----------------------------
- * ✅ Simple in-memory cache (per server instance)
- * ---------------------------- */
-type CacheEntry = { value: any; expiresAt: number };
-const g = globalThis as any;
-g.__planCache ??= new Map<string, CacheEntry>();
-const planCache: Map<string, CacheEntry> = g.__planCache;
+function buildPrompt(input: z.infer<typeof InputSchema>, trainingDays: string[], daysPerWeek: number) {
+  return `
+You are a professional fitness coach.
+Return JSON ONLY. No markdown. No extra text.
 
-function stableKey(obj: any) {
-  // stable stringify for caching
-  const sortKeys = (x: any): any => {
-    if (Array.isArray(x)) return x.map(sortKeys);
-    if (x && typeof x === "object") {
-      return Object.keys(x)
-        .sort()
-        .reduce((acc: any, k) => {
-          acc[k] = sortKeys(x[k]);
-          return acc;
-        }, {});
-    }
-    return x;
-  };
-  return JSON.stringify(sortKeys(obj));
-}
+Create a realistic 4-week training plan.
 
-function getCache(key: string) {
-  const hit = planCache.get(key);
-  if (!hit) return null;
-  if (Date.now() > hit.expiresAt) {
-    planCache.delete(key);
-    return null;
-  }
-  return hit.value;
-}
+Hard rules:
+- Exactly ${daysPerWeek} sessions per week.
+- Each session.day MUST be exactly one of: ${trainingDays.join(", ")}
+- Each week must include each of those training days exactly once.
+- Each session: day, focus, exercises (4-8 items)
+- Each exercise: name, sets (2-5), reps ("8-12" or number), restSec (45-120)
 
-function setCache(key: string, value: any, ttlMs: number) {
-  planCache.set(key, { value, expiresAt: Date.now() + ttlMs });
-}
+User:
+Goal: ${input.goal}
+Experience: ${input.experience}
+Training days: ${trainingDays.join(", ")}
+Session length: ${input.sessionMinutes} minutes
+Equipment: ${input.equipment.join(", ") || "none"}
+Injuries: ${input.injuries || "none"}
 
-export async function POST(req: Request) {
-  const t0 = Date.now();
-
-  try {
-    const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) {
-      return NextResponse.json({ ok: false, error: "Missing OPENAI_API_KEY" }, { status: 500 });
-    }
-
-    const body = await req.json();
-    const input = InputSchema.parse(body);
-
-    const trainingDays =
-      input.trainingDays?.length > 0
-        ? input.trainingDays
-        : DEFAULT_ORDER.slice(0, input.daysPerWeek);
-
-    const daysPerWeek = trainingDays.length;
-
-    // ✅ Cache by normalized input
-    const cacheKey = stableKey({
-      goal: input.goal,
-      experience: input.experience,
-      daysPerWeek,
-      trainingDays,
-      equipment: input.equipment,
-      injuries: input.injuries,
-      sessionMinutes: input.sessionMinutes,
-    });
-
-    const cached = getCache(cacheKey);
-    if (cached) {
-      return NextResponse.json({ ok: true, plan: cached, cached: true, ms: Date.now() - t0 });
-    }
-
-    const openai = new OpenAI({ apiKey });
-
-    // ✅ Much shorter prompt (same rules, fewer tokens)
-    const userPrompt = [
-      `Create a realistic 4-week training plan as JSON only (no markdown).`,
-      ``,
-      `Rules:`,
-      `- Exactly ${daysPerWeek} sessions per week.`,
-      `- Session.day MUST be one of: ${trainingDays.join(", ")} (use exactly these strings).`,
-      `- Every week must include each day exactly once (no missing, no extra).`,
-      `- Each session: { day, focus, exercises }`,
-      `- exercises: 4..8 items`,
-      `- each exercise: { name, sets(2..5), reps("8-12" or number), restSec(45..120) }`,
-      ``,
-      `User:`,
-      `Goal: ${input.goal}`,
-      `Experience: ${input.experience}`,
-      `Training days: ${trainingDays.join(", ")}`,
-      `Session length: ${input.sessionMinutes} min`,
-      `Equipment: ${input.equipment.join(", ") || "none"}`,
-      `Injuries: ${input.injuries || "none"}`,
-      ``,
-      `Output must match this exact shape:`,
-      `{
+Output must match this exact shape:
+{
   "goal": string,
   "experience": string,
   "days_per_week": number,
@@ -178,35 +100,92 @@ export async function POST(req: Request) {
       }
     ]
   }
-}`,
-      ``,
-      `Make weeks 2-4 slightly progressive but keep the same training_days structure.`,
-    ].join("\n");
+}
+Weeks 2-4 should be slightly progressive.
+`.trim();
+}
 
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4.1-mini",
-      temperature: 0.35,
-      response_format: { type: "json_object" },
-      max_tokens: 2500, // ✅ prevents runaway / keeps it fast
-      messages: [
-        { role: "system", content: "Return valid JSON only. No markdown." },
-        { role: "user", content: userPrompt },
-      ],
-    });
+async function createPlanJson(openai: OpenAI, prompt: string, temperature: number) {
+  const completion = await openai.chat.completions.create({
+    model: "gpt-4.1-mini",
+    temperature,
+    // keep outputs bounded
+    max_tokens: 1800,
+    response_format: { type: "json_object" },
+    messages: [
+      { role: "system", content: "Return valid JSON only. No markdown. No extra text." },
+      { role: "user", content: prompt },
+    ],
+  });
 
-    const content = completion.choices[0]?.message?.content ?? "{}";
+  const content = completion.choices[0]?.message?.content ?? "";
+  // If OpenAI ever returns empty/null (rare) -> fail fast
+  if (!content || !content.trim()) {
+    throw new Error("Empty JSON response from model");
+  }
 
-    let parsed: any;
-    try {
-      parsed = JSON.parse(content);
-    } catch {
-      return NextResponse.json(
-        { ok: false, error: "Model returned invalid JSON", raw: content.slice(0, 500) },
-        { status: 400 }
-      );
+  // JSON.parse can still fail if the model violated constraints (OpenAI sometimes throws earlier too)
+  return JSON.parse(content);
+}
+
+export async function POST(req: Request) {
+  try {
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      return NextResponse.json({ ok: false, error: "Missing OPENAI_API_KEY" }, { status: 500 });
     }
 
-    // ✅ Hard safety checks
+    const openai = new OpenAI({ apiKey });
+
+    const body = await req.json();
+    const input = InputSchema.parse(body);
+
+    const trainingDays =
+      input.trainingDays?.length > 0
+        ? input.trainingDays
+        : DEFAULT_ORDER.slice(0, input.daysPerWeek);
+
+    const daysPerWeek = trainingDays.length;
+    const prompt = buildPrompt(input, trainingDays, daysPerWeek);
+
+    // ✅ Retry plan: if OpenAI complains about invalid JSON, retry with lower temp
+    let parsed: any = null;
+    const attempts = [
+      { t: 0.4 },
+      { t: 0.0 },
+    ];
+
+    let lastErr: any = null;
+
+    for (const a of attempts) {
+      try {
+        parsed = await createPlanJson(openai, prompt, a.t);
+        lastErr = null;
+        break;
+      } catch (e: any) {
+        const msg = String(e?.message ?? "");
+        lastErr = e;
+
+        // If it's NOT a JSON-format issue, stop retrying
+        const jsonish =
+          msg.toLowerCase().includes("invalid json") ||
+          msg.toLowerCase().includes("model returned invalid json") ||
+          msg.toLowerCase().includes("json") ||
+          msg.toLowerCase().includes("parse");
+
+        if (!jsonish) break;
+      }
+    }
+
+    if (!parsed) {
+      const message =
+        lastErr?.response?.data?.error?.message ||
+        lastErr?.message ||
+        "Unknown error";
+      return NextResponse.json({ ok: false, error: message }, { status: 400 });
+    }
+
+    // --- Validate output shape a bit
     const weeks = parsed?.plan?.weeks;
     if (!Array.isArray(weeks) || weeks.length === 0) {
       return NextResponse.json(
@@ -231,7 +210,10 @@ export async function POST(req: Request) {
       for (const d of trainingDays) {
         if (!daySet.has(d)) {
           return NextResponse.json(
-            { ok: false, error: `Model output invalid: week ${w?.week ?? "?"} missing day "${d}".` },
+            {
+              ok: false,
+              error: `Model output invalid: week ${w?.week ?? "?"} missing day "${d}".`,
+            },
             { status: 400 }
           );
         }
@@ -247,10 +229,7 @@ export async function POST(req: Request) {
       plan: parsed?.plan,
     };
 
-    // ✅ Cache for 6 hours (tune later)
-    setCache(cacheKey, plan, 6 * 60 * 60 * 1000);
-
-    return NextResponse.json({ ok: true, plan, cached: false, ms: Date.now() - t0 });
+    return NextResponse.json({ ok: true, plan });
   } catch (error: any) {
     const message =
       error?.response?.data?.error?.message ||
