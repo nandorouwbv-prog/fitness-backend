@@ -83,6 +83,30 @@ Return ONLY via the function tool call.
 `.trim();
 }
 
+/** ✅ NEW: repair invalid JSON from tool arguments */
+async function repairJsonWithModel(openai: OpenAI, broken: string) {
+  const fix = await openai.chat.completions.create({
+    model: "gpt-4.1-mini",
+    temperature: 0,
+    response_format: { type: "json_object" },
+    messages: [
+      {
+        role: "system",
+        content:
+          "You fix invalid JSON. Return valid JSON ONLY. Do not add comments or markdown.",
+      },
+      {
+        role: "user",
+        content: `Fix this invalid JSON and return the corrected JSON only:\n\n${broken}`,
+      },
+    ],
+  });
+
+  const content = fix.choices?.[0]?.message?.content ?? "{}";
+  return JSON.parse(content);
+}
+
+/** ✅ UPDATED: tolerate invalid JSON tool arguments */
 async function runToolPlan(
   openai: OpenAI,
   prompt: string,
@@ -95,7 +119,10 @@ async function runToolPlan(
     temperature,
     max_tokens: 2200,
     messages: [
-      { role: "system", content: "Use the tool to return structured output. No extra text." },
+      {
+        role: "system",
+        content: "Use the tool to return structured output. No extra text.",
+      },
       { role: "user", content: prompt },
     ],
     tools: [
@@ -173,22 +200,31 @@ async function runToolPlan(
     tool_choice: { type: "function", function: { name: toolName } },
   });
 
-  const msg = completion.choices?.[0]?.message;
-  const toolCalls = (msg as any)?.tool_calls ?? [];
+  const msg = completion.choices?.[0]?.message as any;
+  const toolCalls = msg?.tool_calls ?? [];
   const argsStr = toolCalls?.[0]?.function?.arguments;
 
   if (!argsStr || typeof argsStr !== "string") {
     throw new Error("Model did not return tool arguments.");
   }
 
-  return JSON.parse(argsStr);
+  // ✅ First try: normal parse
+  try {
+    return JSON.parse(argsStr);
+  } catch {
+    // ✅ Fallback: repair broken JSON (unterminated string etc.)
+    return await repairJsonWithModel(openai, argsStr);
+  }
 }
 
 export async function POST(req: Request) {
   try {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
-      return NextResponse.json({ ok: false, error: "Missing OPENAI_API_KEY" }, { status: 500 });
+      return NextResponse.json(
+        { ok: false, error: "Missing OPENAI_API_KEY" },
+        { status: 500 }
+      );
     }
 
     const openai = new OpenAI({ apiKey });
