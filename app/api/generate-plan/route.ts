@@ -208,13 +208,135 @@ async function runToolPlan(
     throw new Error("Model did not return tool arguments.");
   }
 
-  // ✅ First try: normal parse
   try {
     return JSON.parse(argsStr);
   } catch {
-    // ✅ Fallback: repair broken JSON (unterminated string etc.)
     return await repairJsonWithModel(openai, argsStr);
   }
+}
+
+/** -----------------------------
+ *  ✅ NEW: Auto-repair weeks (prevents crashes)
+ *  ---------------------------- */
+
+function clamp(n: any, min: number, max: number) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return min;
+  return Math.max(min, Math.min(max, x));
+}
+
+function safeStr(v: any) {
+  return String(v ?? "").trim();
+}
+
+function makeFallbackExercises(goal: string) {
+  // simple, safe defaults (4 exercises)
+  const g = safeStr(goal).toLowerCase();
+  const isFat = g.includes("fat") || g.includes("cut") || g.includes("lose");
+  const reps = isFat ? "12-15" : "8-12";
+
+  return [
+    { name: "Incline Dumbbell Press", sets: 3, reps, restSec: 75 },
+    { name: "Lat Pulldown", sets: 3, reps, restSec: 75 },
+    { name: "Leg Press", sets: 3, reps, restSec: 90 },
+    { name: "Plank", sets: 3, reps: "30-45 sec", restSec: 60 },
+  ];
+}
+
+function makeFallbackSession(day: string, goal: string, label = "Recovery / Accessory") {
+  return {
+    day,
+    focus: label,
+    exercises: makeFallbackExercises(goal),
+  };
+}
+
+function coerceToTrainingDay(rawDay: any, trainingDays: string[]): string | null {
+  const d = safeStr(rawDay);
+  if (!d) return null;
+
+  // exact match
+  if (trainingDays.includes(d)) return d;
+
+  // case-insensitive match
+  const lower = d.toLowerCase();
+  const ci = trainingDays.find((x) => x.toLowerCase() === lower);
+  if (ci) return ci;
+
+  // common short forms
+  const short = lower.slice(0, 3);
+  const map: Record<string, string> = {
+    mon: "Monday",
+    tue: "Tuesday",
+    wed: "Wednesday",
+    thu: "Thursday",
+    fri: "Friday",
+    sat: "Saturday",
+    sun: "Sunday",
+  };
+  const full = map[short];
+  if (full && trainingDays.includes(full)) return full;
+
+  return null;
+}
+
+function repairWeekSessions(args: {
+  weekObj: any;
+  trainingDays: string[];
+  daysPerWeek: number;
+  goal: string;
+}) {
+  const { weekObj, trainingDays, daysPerWeek, goal } = args;
+
+  const rawSessions = Array.isArray(weekObj?.sessions) ? weekObj.sessions : [];
+
+  // 1) normalize day -> must be one of trainingDays (or null)
+  const normalized = rawSessions
+    .map((s: any) => {
+      const fixedDay = coerceToTrainingDay(s?.day, trainingDays);
+      const exercises = Array.isArray(s?.exercises) ? s.exercises : [];
+      const hasEnough = exercises.length >= 1;
+
+      // keep if we can place it on a training day
+      if (!fixedDay) return null;
+
+      return {
+        ...s,
+        day: fixedDay,
+        focus: safeStr(s?.focus) || "Training",
+        exercises: hasEnough ? exercises : makeFallbackExercises(goal),
+      };
+    })
+    .filter(Boolean) as any[];
+
+  // 2) ensure unique day per week (keep first occurrence)
+  const seen = new Set<string>();
+  const uniqueByDay: any[] = [];
+  for (const s of normalized) {
+    const d = safeStr(s.day);
+    if (!d || seen.has(d)) continue;
+    seen.add(d);
+    uniqueByDay.push(s);
+  }
+
+  // 3) fill missing trainingDays with fallback sessions
+  const missing = trainingDays.filter((d) => !seen.has(d));
+  for (const d of missing) {
+    uniqueByDay.push(makeFallbackSession(d, goal, "Recovery / Accessory"));
+  }
+
+  // 4) sort sessions to match trainingDays order
+  uniqueByDay.sort(
+    (a, b) => trainingDays.indexOf(a.day) - trainingDays.indexOf(b.day)
+  );
+
+  // 5) enforce exact length (trim if too many)
+  const finalSessions = uniqueByDay.slice(0, daysPerWeek);
+
+  return {
+    ...weekObj,
+    sessions: finalSessions,
+  };
 }
 
 export async function POST(req: Request) {
@@ -262,7 +384,7 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: false, error: message }, { status: 400 });
     }
 
-    // ✅ Hard safety checks: sessions length + required days
+    // ✅ weeks exist?
     const weeks = parsed?.plan?.weeks;
     if (!Array.isArray(weeks) || weeks.length === 0) {
       return NextResponse.json(
@@ -271,13 +393,24 @@ export async function POST(req: Request) {
       );
     }
 
-    for (const w of weeks) {
+    // ✅ NEW: repair instead of hard-fail
+    const repairedWeeks = weeks.map((w: any) =>
+      repairWeekSessions({
+        weekObj: w,
+        trainingDays,
+        daysPerWeek,
+        goal: parsed?.goal ?? input.goal,
+      })
+    );
+
+    // (Optional) still sanity-check after repair
+    for (const w of repairedWeeks) {
       const sessions = Array.isArray(w?.sessions) ? w.sessions : [];
       if (sessions.length !== daysPerWeek) {
         return NextResponse.json(
           {
             ok: false,
-            error: `Model output invalid: week ${w?.week ?? "?"} has ${sessions.length} sessions, expected ${daysPerWeek}.`,
+            error: `Repair failed: week ${w?.week ?? "?"} has ${sessions.length} sessions, expected ${daysPerWeek}.`,
           },
           { status: 400 }
         );
@@ -289,7 +422,7 @@ export async function POST(req: Request) {
           return NextResponse.json(
             {
               ok: false,
-              error: `Model output invalid: week ${w?.week ?? "?"} missing day "${d}".`,
+              error: `Repair failed: week ${w?.week ?? "?"} missing day "${d}".`,
             },
             { status: 400 }
           );
@@ -304,7 +437,10 @@ export async function POST(req: Request) {
       days_per_week: daysPerWeek,
       training_days: trainingDays,
       session_length_minutes: input.sessionMinutes,
-      plan: parsed?.plan,
+      plan: {
+        ...(parsed?.plan ?? {}),
+        weeks: repairedWeeks,
+      },
     };
 
     return NextResponse.json({ ok: true, plan });
