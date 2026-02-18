@@ -1,3 +1,4 @@
+// app/api/generate-plan/route.ts
 import OpenAI from "openai";
 import { z } from "zod";
 import { NextResponse } from "next/server";
@@ -37,8 +38,7 @@ const InputSchema = z
       if (val.trainingDays.length !== val.daysPerWeek) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
-          message:
-            "trainingDays length must match daysPerWeek (or omit trainingDays).",
+          message: "trainingDays length must match daysPerWeek (or omit trainingDays).",
           path: ["trainingDays"],
         });
       }
@@ -55,6 +55,7 @@ const DEFAULT_ORDER: Array<z.infer<typeof Weekday>> = [
   "Sunday",
 ];
 
+/** ✅ CHANGED: Generate ONLY 1 week (faster, less failures) */
 function buildPrompt(
   input: z.infer<typeof InputSchema>,
   trainingDays: string[],
@@ -62,12 +63,12 @@ function buildPrompt(
 ) {
   return `
 You are a professional fitness coach.
-Create a realistic 4-week training plan.
+Create a realistic 1-week training plan (Week 1 only).
 
 Hard rules:
-- Exactly ${daysPerWeek} sessions per week.
+- Exactly ${daysPerWeek} sessions in the week.
 - Each session.day MUST be exactly one of: ${trainingDays.join(", ")}
-- Each week must include each of those training days exactly once.
+- Week 1 must include each of those training days exactly once.
 - Each session has: day, focus, exercises (4-8)
 - Each exercise has: name, sets (2-5), reps ("8-12" or number), restSec (45-120)
 
@@ -83,7 +84,7 @@ Return ONLY via the function tool call.
 `.trim();
 }
 
-/** ✅ NEW: repair invalid JSON from tool arguments */
+/** ✅ repair invalid JSON from tool arguments */
 async function repairJsonWithModel(openai: OpenAI, broken: string) {
   const fix = await openai.chat.completions.create({
     model: "gpt-4.1-mini",
@@ -92,8 +93,7 @@ async function repairJsonWithModel(openai: OpenAI, broken: string) {
     messages: [
       {
         role: "system",
-        content:
-          "You fix invalid JSON. Return valid JSON ONLY. Do not add comments or markdown.",
+        content: "You fix invalid JSON. Return valid JSON ONLY. Do not add comments or markdown.",
       },
       {
         role: "user",
@@ -106,23 +106,16 @@ async function repairJsonWithModel(openai: OpenAI, broken: string) {
   return JSON.parse(content);
 }
 
-/** ✅ UPDATED: tolerate invalid JSON tool arguments */
-async function runToolPlan(
-  openai: OpenAI,
-  prompt: string,
-  temperature: number
-): Promise<any> {
+/** ✅ UPDATED: 1-week tool schema + lower tokens */
+async function runToolPlan(openai: OpenAI, prompt: string, temperature: number): Promise<any> {
   const toolName = "create_training_plan";
 
   const completion = await openai.chat.completions.create({
     model: "gpt-4.1-mini",
     temperature,
-    max_tokens: 2200,
+    max_tokens: 1200, // ✅ was 2200; 1 week needs less -> faster
     messages: [
-      {
-        role: "system",
-        content: "Use the tool to return structured output. No extra text.",
-      },
+      { role: "system", content: "Use the tool to return structured output. No extra text." },
       { role: "user", content: prompt },
     ],
     tools: [
@@ -130,7 +123,7 @@ async function runToolPlan(
         type: "function",
         function: {
           name: toolName,
-          description: "Return a 4-week training plan in a strict JSON structure.",
+          description: "Return a 1-week training plan (Week 1) in a strict JSON structure.",
           parameters: {
             type: "object",
             additionalProperties: false,
@@ -146,6 +139,8 @@ async function runToolPlan(
                 properties: {
                   weeks: {
                     type: "array",
+                    minItems: 1,
+                    maxItems: 1, // ✅ enforce only 1 week
                     items: {
                       type: "object",
                       additionalProperties: false,
@@ -216,21 +211,14 @@ async function runToolPlan(
 }
 
 /** -----------------------------
- *  ✅ NEW: Auto-repair weeks (prevents crashes)
+ *  Auto-repair week sessions (keeps it stable)
  *  ---------------------------- */
-
-function clamp(n: any, min: number, max: number) {
-  const x = Number(n);
-  if (!Number.isFinite(x)) return min;
-  return Math.max(min, Math.min(max, x));
-}
 
 function safeStr(v: any) {
   return String(v ?? "").trim();
 }
 
 function makeFallbackExercises(goal: string) {
-  // simple, safe defaults (4 exercises)
   const g = safeStr(goal).toLowerCase();
   const isFat = g.includes("fat") || g.includes("cut") || g.includes("lose");
   const reps = isFat ? "12-15" : "8-12";
@@ -243,27 +231,20 @@ function makeFallbackExercises(goal: string) {
   ];
 }
 
-function makeFallbackSession(day: string, goal: string, label = "Recovery / Accessory") {
-  return {
-    day,
-    focus: label,
-    exercises: makeFallbackExercises(goal),
-  };
+function makeFallbackSession(day: string, goal: string, label = "Training") {
+  return { day, focus: label, exercises: makeFallbackExercises(goal) };
 }
 
 function coerceToTrainingDay(rawDay: any, trainingDays: string[]): string | null {
   const d = safeStr(rawDay);
   if (!d) return null;
 
-  // exact match
   if (trainingDays.includes(d)) return d;
 
-  // case-insensitive match
   const lower = d.toLowerCase();
   const ci = trainingDays.find((x) => x.toLowerCase() === lower);
   if (ci) return ci;
 
-  // common short forms
   const short = lower.slice(0, 3);
   const map: Record<string, string> = {
     mon: "Monday",
@@ -290,26 +271,21 @@ function repairWeekSessions(args: {
 
   const rawSessions = Array.isArray(weekObj?.sessions) ? weekObj.sessions : [];
 
-  // 1) normalize day -> must be one of trainingDays (or null)
   const normalized = rawSessions
     .map((s: any) => {
       const fixedDay = coerceToTrainingDay(s?.day, trainingDays);
-      const exercises = Array.isArray(s?.exercises) ? s.exercises : [];
-      const hasEnough = exercises.length >= 1;
-
-      // keep if we can place it on a training day
       if (!fixedDay) return null;
 
+      const exercises = Array.isArray(s?.exercises) ? s.exercises : [];
       return {
         ...s,
         day: fixedDay,
         focus: safeStr(s?.focus) || "Training",
-        exercises: hasEnough ? exercises : makeFallbackExercises(goal),
+        exercises: exercises.length >= 1 ? exercises : makeFallbackExercises(goal),
       };
     })
     .filter(Boolean) as any[];
 
-  // 2) ensure unique day per week (keep first occurrence)
   const seen = new Set<string>();
   const uniqueByDay: any[] = [];
   for (const s of normalized) {
@@ -319,34 +295,21 @@ function repairWeekSessions(args: {
     uniqueByDay.push(s);
   }
 
-  // 3) fill missing trainingDays with fallback sessions
   const missing = trainingDays.filter((d) => !seen.has(d));
   for (const d of missing) {
-    uniqueByDay.push(makeFallbackSession(d, goal, "Recovery / Accessory"));
+    uniqueByDay.push(makeFallbackSession(d, goal, "Training"));
   }
 
-  // 4) sort sessions to match trainingDays order
-  uniqueByDay.sort(
-    (a, b) => trainingDays.indexOf(a.day) - trainingDays.indexOf(b.day)
-  );
+  uniqueByDay.sort((a, b) => trainingDays.indexOf(a.day) - trainingDays.indexOf(b.day));
 
-  // 5) enforce exact length (trim if too many)
-  const finalSessions = uniqueByDay.slice(0, daysPerWeek);
-
-  return {
-    ...weekObj,
-    sessions: finalSessions,
-  };
+  return { ...weekObj, week: 1, sessions: uniqueByDay.slice(0, daysPerWeek) };
 }
 
 export async function POST(req: Request) {
   try {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
-      return NextResponse.json(
-        { ok: false, error: "Missing OPENAI_API_KEY" },
-        { status: 500 }
-      );
+      return NextResponse.json({ ok: false, error: "Missing OPENAI_API_KEY" }, { status: 500 });
     }
 
     const openai = new OpenAI({ apiKey });
@@ -366,7 +329,7 @@ export async function POST(req: Request) {
     let parsed: any = null;
     let lastErr: any = null;
 
-    for (const t of [0.4, 0.0]) {
+    for (const t of [0.0, 0.2]) {
       try {
         parsed = await runToolPlan(openai, prompt, t);
         lastErr = null;
@@ -378,55 +341,44 @@ export async function POST(req: Request) {
 
     if (!parsed) {
       const message =
-        lastErr?.response?.data?.error?.message ||
-        lastErr?.message ||
-        "Unknown error";
+        lastErr?.response?.data?.error?.message || lastErr?.message || "Unknown error";
       return NextResponse.json({ ok: false, error: message }, { status: 400 });
     }
 
     // ✅ weeks exist?
     const weeks = parsed?.plan?.weeks;
     if (!Array.isArray(weeks) || weeks.length === 0) {
+      return NextResponse.json({ ok: false, error: "Model output missing plan.weeks[]" }, { status: 400 });
+    }
+
+    // ✅ ONLY keep Week 1 and repair it
+    const w1 = weeks[0];
+    const repairedWeek1 = repairWeekSessions({
+      weekObj: w1,
+      trainingDays,
+      daysPerWeek,
+      goal: parsed?.goal ?? input.goal,
+    });
+
+    // ✅ sanity check after repair
+    const sessions = Array.isArray(repairedWeek1?.sessions) ? repairedWeek1.sessions : [];
+    if (sessions.length !== daysPerWeek) {
       return NextResponse.json(
-        { ok: false, error: "Model output missing plan.weeks[]" },
+        {
+          ok: false,
+          error: `Repair failed: week 1 has ${sessions.length} sessions, expected ${daysPerWeek}.`,
+        },
         { status: 400 }
       );
     }
 
-    // ✅ NEW: repair instead of hard-fail
-    const repairedWeeks = weeks.map((w: any) =>
-      repairWeekSessions({
-        weekObj: w,
-        trainingDays,
-        daysPerWeek,
-        goal: parsed?.goal ?? input.goal,
-      })
-    );
-
-    // (Optional) still sanity-check after repair
-    for (const w of repairedWeeks) {
-      const sessions = Array.isArray(w?.sessions) ? w.sessions : [];
-      if (sessions.length !== daysPerWeek) {
+    const daySet = new Set(sessions.map((s: any) => String(s?.day ?? "")));
+    for (const d of trainingDays) {
+      if (!daySet.has(d)) {
         return NextResponse.json(
-          {
-            ok: false,
-            error: `Repair failed: week ${w?.week ?? "?"} has ${sessions.length} sessions, expected ${daysPerWeek}.`,
-          },
+          { ok: false, error: `Repair failed: week 1 missing day "${d}".` },
           { status: 400 }
         );
-      }
-
-      const daySet = new Set(sessions.map((s: any) => String(s?.day ?? "")));
-      for (const d of trainingDays) {
-        if (!daySet.has(d)) {
-          return NextResponse.json(
-            {
-              ok: false,
-              error: `Repair failed: week ${w?.week ?? "?"} missing day "${d}".`,
-            },
-            { status: 400 }
-          );
-        }
       }
     }
 
@@ -438,19 +390,15 @@ export async function POST(req: Request) {
       training_days: trainingDays,
       session_length_minutes: input.sessionMinutes,
       plan: {
-        ...(parsed?.plan ?? {}),
-        weeks: repairedWeeks,
+        weeks: [repairedWeek1], // ✅ only 1 week returned now
       },
     };
 
     return NextResponse.json({ ok: true, plan });
   } catch (error: any) {
     const message =
-      error?.response?.data?.error?.message ||
-      error?.message ||
-      "Unknown error";
+      error?.response?.data?.error?.message || error?.message || "Unknown error";
 
     return NextResponse.json({ ok: false, error: message }, { status: 400 });
   }
 }
-
