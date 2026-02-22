@@ -24,6 +24,33 @@ const InputSchema = z
     equipment: z.array(z.string()).optional().default([]),
     injuries: z.string().optional().default(""),
     sessionMinutes: z.number().min(20).max(120).default(45),
+
+    // ✅ NEW: optional physique analysis from your /api/physique/analyze
+    physique: z
+      .object({
+        summary: z.string().optional().default(""),
+        strengths: z.array(z.string()).optional().default([]),
+        weaknesses: z.array(z.string()).optional().default([]),
+        focusAreas: z.array(z.string()).optional().default([]),
+        symmetryNotes: z.array(z.string()).optional().default([]),
+        estimatedBodyfatRange: z.string().optional().default("uncertain"),
+        trainingBias: z
+          .object({
+            style: z.enum(["hypertrophy", "strength", "mixed"]).optional().default("hypertrophy"),
+            volume: z.enum(["low", "medium", "high"]).optional().default("medium"),
+            notes: z.string().optional().default(""),
+          })
+          .optional()
+          .default({ style: "hypertrophy", volume: "medium", notes: "" }),
+        exercisePreferences: z
+          .object({
+            emphasis: z.array(z.string()).optional().default([]),
+            avoid: z.array(z.string()).optional().default([]),
+          })
+          .optional()
+          .default({ emphasis: [], avoid: [] }),
+       })
+      .optional(),
   })
   .superRefine((val, ctx) => {
     if (val.trainingDays?.length) {
@@ -61,6 +88,25 @@ function buildPrompt(
   trainingDays: string[],
   daysPerWeek: number
 ) {
+  const p = input.physique;
+
+  const physiqueBlock = p
+    ? `
+Physique analysis (from photos):
+- Summary: ${p.summary || "—"}
+- Strengths: ${(p.strengths || []).join(", ") || "—"}
+- Weaknesses: ${(p.weaknesses || []).join(", ") || "—"}
+- Focus areas: ${(p.focusAreas || []).join(", ") || "—"}
+- Symmetry notes: ${(p.symmetryNotes || []).join(", ") || "—"}
+- Estimated bodyfat range: ${p.estimatedBodyfatRange || "uncertain"}
+- Training bias: style=${p.trainingBias?.style || "hypertrophy"}, volume=${
+        p.trainingBias?.volume || "medium"
+      } (${p.trainingBias?.notes || ""})
+- Prefer: ${(p.exercisePreferences?.emphasis || []).join(", ") || "—"}
+- Avoid: ${(p.exercisePreferences?.avoid || []).join(", ") || "—"}
+`.trim()
+    : "";
+
   return `
 You are a professional fitness coach.
 Create a realistic 1-week training plan (Week 1 only).
@@ -79,6 +125,14 @@ Training days: ${trainingDays.join(", ")}
 Session length: ${input.sessionMinutes} minutes
 Equipment: ${input.equipment.join(", ") || "none"}
 Injuries: ${input.injuries || "none"}
+
+${physiqueBlock ? `${physiqueBlock}\n` : ""}
+
+Important coaching rules:
+- If physique suggests "fitness only" / strength focus, bias toward hypertrophy/strength training (machines + free weights),
+  avoid excessive athletic/conditioning circuits.
+- Use focusAreas/weaknesses to bias exercise selection across the week (e.g. more rear delts/lats/upper chest if needed).
+- Keep it realistic for the sessionMinutes and experience level.
 
 Return ONLY via the function tool call.
 `.trim();
@@ -348,7 +402,10 @@ export async function POST(req: Request) {
     // ✅ weeks exist?
     const weeks = parsed?.plan?.weeks;
     if (!Array.isArray(weeks) || weeks.length === 0) {
-      return NextResponse.json({ ok: false, error: "Model output missing plan.weeks[]" }, { status: 400 });
+      return NextResponse.json(
+        { ok: false, error: "Model output missing plan.weeks[]" },
+        { status: 400 }
+      );
     }
 
     // ✅ ONLY keep Week 1 and repair it
