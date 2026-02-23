@@ -15,6 +15,33 @@ const Weekday = z.enum([
   "Sunday",
 ]);
 
+const PhysiqueSchema = z.object({
+  summary: z.string().optional().default(""),
+  strengths: z.array(z.string()).optional().default([]),
+  weaknesses: z.array(z.string()).optional().default([]),
+  focusAreas: z.array(z.string()).optional().default([]),
+  symmetryNotes: z.array(z.string()).optional().default([]),
+  estimatedBodyfatRange: z.string().optional().default("uncertain"),
+  trainingBias: z
+    .object({
+      style: z
+        .enum(["hypertrophy", "strength", "mixed"])
+        .optional()
+        .default("hypertrophy"),
+      volume: z.enum(["low", "medium", "high"]).optional().default("medium"),
+      notes: z.string().optional().default(""),
+    })
+    .optional()
+    .default({ style: "hypertrophy", volume: "medium", notes: "" }),
+  exercisePreferences: z
+    .object({
+      emphasis: z.array(z.string()).optional().default([]),
+      avoid: z.array(z.string()).optional().default([]),
+    })
+    .optional()
+    .default({ emphasis: [], avoid: [] }),
+});
+
 const InputSchema = z
   .object({
     goal: z.string(),
@@ -25,32 +52,15 @@ const InputSchema = z
     injuries: z.string().optional().default(""),
     sessionMinutes: z.number().min(20).max(120).default(45),
 
-    // ✅ NEW: optional physique analysis from your /api/physique/analyze
-    physique: z
-      .object({
-        summary: z.string().optional().default(""),
-        strengths: z.array(z.string()).optional().default([]),
-        weaknesses: z.array(z.string()).optional().default([]),
-        focusAreas: z.array(z.string()).optional().default([]),
-        symmetryNotes: z.array(z.string()).optional().default([]),
-        estimatedBodyfatRange: z.string().optional().default("uncertain"),
-        trainingBias: z
-          .object({
-            style: z.enum(["hypertrophy", "strength", "mixed"]).optional().default("hypertrophy"),
-            volume: z.enum(["low", "medium", "high"]).optional().default("medium"),
-            notes: z.string().optional().default(""),
-          })
-          .optional()
-          .default({ style: "hypertrophy", volume: "medium", notes: "" }),
-        exercisePreferences: z
-          .object({
-            emphasis: z.array(z.string()).optional().default([]),
-            avoid: z.array(z.string()).optional().default([]),
-          })
-          .optional()
-          .default({ emphasis: [], avoid: [] }),
-       })
-      .optional(),
+    // ✅ FIX: accept null + treat as "omitted"
+    // physique can be:
+    // - undefined (omitted) ✅
+    // - null (from client) ✅ -> becomes undefined
+    // - object (valid) ✅
+    physique: z.preprocess(
+      (v) => (v === null ? undefined : v),
+      PhysiqueSchema.optional()
+    ),
   })
   .superRefine((val, ctx) => {
     if (val.trainingDays?.length) {
