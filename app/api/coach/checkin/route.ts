@@ -23,6 +23,8 @@ type CoachAIResponse = {
     requestId?: string;
     model?: string;
     tookMs?: number;
+    corrected?: boolean;
+    correctionReason?: string;
   };
 };
 
@@ -114,6 +116,21 @@ async function withTimeout<T>(p: Promise<T>, timeoutMs: number, label = "timeout
   }
 }
 
+// ✅ tiny helper: detect "low energy/sleep" claims in summary
+function looksLikeLowEnergySleep(summary: string) {
+  const s = summary.toLowerCase();
+  return (
+    s.includes("low energy") ||
+    s.includes("energy was low") ||
+    s.includes("challenging with energy") ||
+    s.includes("challenging with sleep") ||
+    s.includes("sleep was low") ||
+    s.includes("poor sleep") ||
+    s.includes("tired") ||
+    s.includes("fatigue")
+  );
+}
+
 export async function POST(req: Request) {
   const started = Date.now();
 
@@ -131,7 +148,7 @@ export async function POST(req: Request) {
     const checkin = body?.checkin ?? {};
     const context = body?.context ?? {};
 
-    const language = pickLanguage(context); // ✅ "en" default
+    const language = pickLanguage(context);
 
     const payload = {
       dateISO: safeStr(checkin?.dateISO, 20),
@@ -159,7 +176,7 @@ export async function POST(req: Request) {
       stats: context?.stats ?? {},
       week: context?.week ?? {},
       today: context?.today ?? {},
-      // ✅ helps variation + prevents “same wording”
+      // helps variation + debugging
       requestId,
       nowISO: new Date().toISOString(),
     };
@@ -179,55 +196,88 @@ export async function POST(req: Request) {
 
     const openai = new OpenAI({ apiKey });
 
+    // ✅ data-locked system prompt
     const system = `
-You are a fitness coach inside a mobile app.
-You MUST return ONLY valid JSON (no markdown, no extra text).
-Be supportive, clear, and short. No medical diagnosis.
-If the user mentions sharp pain, numbness, dizziness, chest pain, or severe symptoms:
+You are a premium strength coach inside a mobile app.
+
+CRITICAL RULES (must follow):
+- Use the numeric ratings exactly as truth. Do NOT claim low energy/sleep if ratings are high.
+- If energy >= 4 AND sleep >= 4, you MUST describe the week as positive (not challenging).
+- Only mention struggles if notesStruggle contains a real issue or ratings show it.
+- Reference at least 1 concrete detail from notesGood or notesStruggle in the summary.
+- Avoid generic clichés like "consistency is key" unless you tie it to a specific fact.
+- Keep it short, direct, practical. No medical diagnosis. No illegal substances.
+
+If sharp pain, numbness, dizziness, chest pain, or severe symptoms:
 set safety.flag=true and advise to stop and seek professional help.
-Do not recommend illegal substances.
 
-Important:
-- Avoid repeating the same phrasing as prior check-ins.
-- Use the user's notesGood/notesStruggle to personalize the output.
-- Use different wording each time.
-
+Return ONLY valid JSON (no markdown, no extra text).
 Output language: ${language === "nl" ? "Dutch" : "English"}.
+
 JSON schema:
 {
   "summary": string (1-2 sentences),
   "wins": string[] (1-3),
   "focus": string[] (2-4),
   "actions_today": string[] (2-4),
-  "next_workout_adjustment": { "type": "...", "details": string },
+  "next_workout_adjustment": { "type": "volume|intensity|exercise_swap|rest|deload|none", "details": string },
   "questions": string[] (0-2),
   "safety": { "flag": boolean, "message": string }
 }
 `.trim();
 
+    // ✅ data-locked user prompt (explicit numbers)
     const user = `
-WEEKLY CHECK-IN DATA:
-${JSON.stringify(payload)}
+WEEKLY CHECK-IN (TRUTH DATA):
+- dateISO: ${payload.dateISO}
+- weight: ${payload.weight ?? "N/A"}
+- energy: ${payload.energy}/5
+- sleep: ${payload.sleep}/5
+- stress: ${payload.stress}/5
+- notesGood: "${payload.notesGood}"
+- notesStruggle: "${payload.notesStruggle}"
+- hasFrontPhoto: ${payload.hasFrontPhoto}
+- hasBackPhoto: ${payload.hasBackPhoto}
 
-CONTEXT:
-${JSON.stringify(ctx)}
+TODAY CONTEXT:
+${JSON.stringify(ctx.today ?? {}, null, 2)}
 
-Task:
-- Summarize the week in 1-2 sentences.
-- Provide wins (1-3), focus (2-4), actions_today (2-4).
-- Give ONE adjustment suggestion (or none). Keep it safe.
-- Max 2 questions only if needed.
-Language: ${language === "nl" ? "Dutch" : "English"}.
+PROFILE CONTEXT:
+${JSON.stringify(
+  {
+    profileName: ctx.profileName,
+    goal: ctx.goal,
+    fitnessLevel: ctx.fitnessLevel,
+    daysPerWeek: ctx.daysPerWeek,
+    minutesPerSession: ctx.minutesPerSession,
+    trainingSetup: ctx.trainingSetup,
+  },
+  null,
+  2
+)}
+
+STRICT CHECKS:
+- If energy >= 4 AND sleep >= 4: do NOT say the week was challenging; describe it positively.
+- If notesStruggle is empty and ratings are high: do not invent problems.
+- Mention energy/sleep/stress numbers in the summary OR in the first focus bullet.
+
+TASK:
+- summary: 1–2 sentences, must reference at least 1 detail from notesGood or notesStruggle.
+- wins: 1–3 specific observations tied to the data.
+- focus: 2–4 actionable priorities (not generic).
+- actions_today: 2–4 concrete steps.
+- next_workout_adjustment: ONE suggestion (or "none") and explain why using the data.
+- questions: 0–2 only if truly needed.
+
 Return JSON only.
 `.trim();
 
-    // ✅ This call is what used to time out at 12s and fall back.
     const resp = await withTimeout(
       openai.chat.completions.create({
         model: modelUsed,
-        temperature: 0.75,
-        presence_penalty: 0.35,
-        frequency_penalty: 0.2,
+        temperature: 0.85,
+        presence_penalty: 0.55,
+        frequency_penalty: 0.35,
         response_format: { type: "json_object" },
         messages: [
           { role: "system", content: system },
@@ -239,9 +289,10 @@ Return JSON only.
     );
 
     const raw = resp.choices?.[0]?.message?.content ?? "";
+    console.log("OPENAI RAW RESPONSE:");
+    console.log(raw);
+
     let parsed: any = null;
-console.log("OPENAI RAW RESPONSE:");
-console.log(raw);
     try {
       parsed = raw ? JSON.parse(raw) : null;
     } catch {
@@ -261,8 +312,29 @@ console.log(raw);
       return NextResponse.json(fb, { status: 200, headers: jsonHeaders() });
     }
 
+    let summary = safeStr(parsed.summary, 260) || fb.summary;
+
+    // ✅ SANITY CORRECTION:
+    // If user gave 5/5 and model still claims low energy/sleep -> correct it.
+    let corrected = false;
+    let correctionReason = "";
+
+    if (payload.energy >= 4 && payload.sleep >= 4 && looksLikeLowEnergySleep(summary)) {
+      corrected = true;
+      correctionReason = "Model summary contradicted high energy/sleep ratings.";
+      if (language === "nl") {
+        summary = `Energie (${payload.energy}/5) en slaap (${payload.sleep}/5) zijn sterk — goede basis deze week. ${
+          payload.notesGood ? `Top dat je aangeeft: ${safeStr(payload.notesGood, 120)}.` : ""
+        }`.trim();
+      } else {
+        summary = `Energy (${payload.energy}/5) and sleep (${payload.sleep}/5) were strong — great base this week. ${
+          payload.notesGood ? `You noted: ${safeStr(payload.notesGood, 120)}.` : ""
+        }`.trim();
+      }
+    }
+
     const out: CoachAIResponse = {
-      summary: safeStr(parsed.summary, 260) || fb.summary,
+      summary,
       wins: Array.isArray(parsed.wins)
         ? parsed.wins.map((s: any) => safeStr(s, 120)).filter(Boolean).slice(0, 3)
         : fb.wins,
@@ -288,12 +360,13 @@ console.log(raw);
         requestId,
         model: modelUsed,
         tookMs: Date.now() - started,
+        corrected,
+        correctionReason: corrected ? correctionReason : undefined,
       },
     };
 
     return NextResponse.json(out, { status: 200, headers: jsonHeaders() });
   } catch (e: any) {
-    // ✅ still return usable response, but now you can SEE it was fallback
     const fb = fallbackResponse("en");
     fb.__meta = {
       fallback: true,
