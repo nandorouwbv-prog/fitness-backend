@@ -15,6 +15,15 @@ type CoachAIResponse = {
   };
   questions: string[];
   safety: { flag: boolean; message: string };
+
+  // ✅ optional debug meta (harmless for the app UI)
+  __meta?: {
+    fallback?: boolean;
+    reason?: string;
+    requestId?: string;
+    model?: string;
+    tookMs?: number;
+  };
 };
 
 function clampInt(v: any, min: number, max: number, fallback: number) {
@@ -65,8 +74,7 @@ function fallbackResponse(language: "en" | "nl" = "en"): CoachAIResponse {
   }
 
   return {
-    summary:
-      "Strong check-in. Keep it simple: train consistently, hit protein + water, and lock in sleep.",
+    summary: "Strong check-in. Keep it simple: train consistently, hit protein + water, and lock in sleep.",
     wins: ["You’re tracking — that’s how you win long-term."],
     focus: [
       "Hit your planned sessions (or at least 2 if life is busy).",
@@ -86,13 +94,39 @@ function fallbackResponse(language: "en" | "nl" = "en"): CoachAIResponse {
   };
 }
 
+function jsonHeaders() {
+  return {
+    "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
+    Pragma: "no-cache",
+    Expires: "0",
+  };
+}
+
+async function withTimeout<T>(p: Promise<T>, timeoutMs: number, label = "timeout"): Promise<T> {
+  let t: any;
+  const timeout = new Promise<never>((_, reject) => {
+    t = setTimeout(() => reject(new Error(label)), timeoutMs);
+  });
+  try {
+    return await Promise.race([p, timeout]);
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 export async function POST(req: Request) {
-  const ctrl = new AbortController();
-  const timeoutMs = 12_000;
-  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  const started = Date.now();
+
+  // ✅ This should be LONGER than typical model latency on Vercel
+  const TIMEOUT_MS = 28_000;
+
+  let requestId = "";
+  let modelUsed = process.env.OPENAI_COACH_MODEL || "gpt-4o-mini";
 
   try {
     const body = await req.json();
+
+    requestId = safeStr(body?.requestId, 80) || safeStr(req.headers.get("x-request-id"), 80) || "";
 
     const checkin = body?.checkin ?? {};
     const context = body?.context ?? {};
@@ -112,7 +146,7 @@ export async function POST(req: Request) {
     };
 
     const ctx = {
-      language, // ✅ keep for prompt + debugging
+      language,
       profileName: safeStr(context?.profileName, 60),
       goal: safeStr(context?.goal, 40),
       fitnessLevel: safeStr(context?.fitnessLevel, 40),
@@ -125,9 +159,25 @@ export async function POST(req: Request) {
       stats: context?.stats ?? {},
       week: context?.week ?? {},
       today: context?.today ?? {},
+      // ✅ helps variation + prevents “same wording”
+      requestId,
+      nowISO: new Date().toISOString(),
     };
 
-    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      const fb = fallbackResponse(language);
+      fb.__meta = {
+        fallback: true,
+        reason: "Missing OPENAI_API_KEY",
+        requestId,
+        model: modelUsed,
+        tookMs: Date.now() - started,
+      };
+      return NextResponse.json(fb, { status: 200, headers: jsonHeaders() });
+    }
+
+    const openai = new OpenAI({ apiKey });
 
     const system = `
 You are a fitness coach inside a mobile app.
@@ -136,6 +186,11 @@ Be supportive, clear, and short. No medical diagnosis.
 If the user mentions sharp pain, numbness, dizziness, chest pain, or severe symptoms:
 set safety.flag=true and advise to stop and seek professional help.
 Do not recommend illegal substances.
+
+Important:
+- Avoid repeating the same phrasing as prior check-ins.
+- Use the user's notesGood/notesStruggle to personalize the output.
+- Use different wording each time.
 
 Output language: ${language === "nl" ? "Dutch" : "English"}.
 JSON schema:
@@ -166,68 +221,86 @@ Language: ${language === "nl" ? "Dutch" : "English"}.
 Return JSON only.
 `.trim();
 
-    const model = process.env.OPENAI_COACH_MODEL || "gpt-4o-mini";
-
-    const resp = await openai.chat.completions.create(
-      {
-        model,
-        temperature: 0.4,
+    // ✅ This call is what used to time out at 12s and fall back.
+    const resp = await withTimeout(
+      openai.chat.completions.create({
+        model: modelUsed,
+        temperature: 0.75,
+        presence_penalty: 0.35,
+        frequency_penalty: 0.2,
         response_format: { type: "json_object" },
         messages: [
           { role: "system", content: system },
           { role: "user", content: user },
         ],
-      },
-      { signal: ctrl.signal as any }
+      }),
+      TIMEOUT_MS,
+      "OpenAI timeout"
     );
 
     const raw = resp.choices?.[0]?.message?.content ?? "";
-    let parsed: CoachAIResponse | null = null;
+    let parsed: any = null;
 
     try {
-      parsed = JSON.parse(raw);
+      parsed = raw ? JSON.parse(raw) : null;
     } catch {
       parsed = null;
     }
 
-    if (!parsed || typeof parsed !== "object") {
-      return NextResponse.json(fallbackResponse(language));
-    }
-
     const fb = fallbackResponse(language);
 
+    if (!parsed || typeof parsed !== "object") {
+      fb.__meta = {
+        fallback: true,
+        reason: "Invalid JSON from model",
+        requestId,
+        model: modelUsed,
+        tookMs: Date.now() - started,
+      };
+      return NextResponse.json(fb, { status: 200, headers: jsonHeaders() });
+    }
+
     const out: CoachAIResponse = {
-      summary: safeStr((parsed as any).summary, 260) || fb.summary,
-      wins: Array.isArray((parsed as any).wins)
-        ? (parsed as any).wins.map((s: any) => safeStr(s, 120)).filter(Boolean).slice(0, 3)
+      summary: safeStr(parsed.summary, 260) || fb.summary,
+      wins: Array.isArray(parsed.wins)
+        ? parsed.wins.map((s: any) => safeStr(s, 120)).filter(Boolean).slice(0, 3)
         : fb.wins,
-      focus: Array.isArray((parsed as any).focus)
-        ? (parsed as any).focus.map((s: any) => safeStr(s, 140)).filter(Boolean).slice(0, 4)
+      focus: Array.isArray(parsed.focus)
+        ? parsed.focus.map((s: any) => safeStr(s, 140)).filter(Boolean).slice(0, 4)
         : fb.focus,
-      actions_today: Array.isArray((parsed as any).actions_today)
-        ? (parsed as any).actions_today.map((s: any) => safeStr(s, 140)).filter(Boolean).slice(0, 4)
+      actions_today: Array.isArray(parsed.actions_today)
+        ? parsed.actions_today.map((s: any) => safeStr(s, 140)).filter(Boolean).slice(0, 4)
         : fb.actions_today,
       next_workout_adjustment: {
-        type: ((parsed as any).next_workout_adjustment?.type as any) || "none",
-        details:
-          safeStr((parsed as any).next_workout_adjustment?.details, 180) ||
-          fb.next_workout_adjustment.details,
+        type: (parsed.next_workout_adjustment?.type as any) || "none",
+        details: safeStr(parsed.next_workout_adjustment?.details, 180) || fb.next_workout_adjustment.details,
       },
-      questions: Array.isArray((parsed as any).questions)
-        ? (parsed as any).questions.map((s: any) => safeStr(s, 120)).filter(Boolean).slice(0, 2)
+      questions: Array.isArray(parsed.questions)
+        ? parsed.questions.map((s: any) => safeStr(s, 120)).filter(Boolean).slice(0, 2)
         : fb.questions,
       safety: {
-        flag: !!(parsed as any).safety?.flag,
-        message: safeStr((parsed as any).safety?.message, 220) || "",
+        flag: !!parsed.safety?.flag,
+        message: safeStr(parsed.safety?.message, 220) || "",
+      },
+      __meta: {
+        fallback: false,
+        requestId,
+        model: modelUsed,
+        tookMs: Date.now() - started,
       },
     };
 
-    return NextResponse.json(out);
+    return NextResponse.json(out, { status: 200, headers: jsonHeaders() });
   } catch (e: any) {
-    // Always return a usable response (no hard fail)
-    // default to English fallback when unknown
-    return NextResponse.json(fallbackResponse("en"), { status: 200 });
-  } finally {
-    clearTimeout(t);
+    // ✅ still return usable response, but now you can SEE it was fallback
+    const fb = fallbackResponse("en");
+    fb.__meta = {
+      fallback: true,
+      reason: String(e?.message ?? "Unknown error"),
+      requestId,
+      model: modelUsed,
+      tookMs: Date.now() - started,
+    };
+    return NextResponse.json(fb, { status: 200, headers: jsonHeaders() });
   }
 }
