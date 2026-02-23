@@ -240,7 +240,8 @@ Return JSON only.
 
     const raw = resp.choices?.[0]?.message?.content ?? "";
     let parsed: any = null;
-
+console.log("OPENAI RAW RESPONSE:");
+console.log(raw);
     try {
       parsed = raw ? JSON.parse(raw) : null;
     } catch {
