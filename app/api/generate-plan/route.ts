@@ -53,10 +53,6 @@ const InputSchema = z
     sessionMinutes: z.number().min(20).max(120).default(45),
 
     // ✅ FIX: accept null + treat as "omitted"
-    // physique can be:
-    // - undefined (omitted) ✅
-    // - null (from client) ✅ -> becomes undefined
-    // - object (valid) ✅
     physique: z.preprocess(
       (v) => (v === null ? undefined : v),
       PhysiqueSchema.optional()
@@ -157,7 +153,8 @@ async function repairJsonWithModel(openai: OpenAI, broken: string) {
     messages: [
       {
         role: "system",
-        content: "You fix invalid JSON. Return valid JSON ONLY. Do not add comments or markdown.",
+        content:
+          "You fix invalid JSON. Return valid JSON ONLY. Do not add comments or markdown.",
       },
       {
         role: "user",
@@ -171,15 +168,22 @@ async function repairJsonWithModel(openai: OpenAI, broken: string) {
 }
 
 /** ✅ UPDATED: 1-week tool schema + lower tokens */
-async function runToolPlan(openai: OpenAI, prompt: string, temperature: number): Promise<any> {
+async function runToolPlan(
+  openai: OpenAI,
+  prompt: string,
+  temperature: number
+): Promise<any> {
   const toolName = "create_training_plan";
 
   const completion = await openai.chat.completions.create({
     model: "gpt-4.1-mini",
     temperature,
-    max_tokens: 1200, // ✅ was 2200; 1 week needs less -> faster
+    max_tokens: 1200,
     messages: [
-      { role: "system", content: "Use the tool to return structured output. No extra text." },
+      {
+        role: "system",
+        content: "Use the tool to return structured output. No extra text.",
+      },
       { role: "user", content: prompt },
     ],
     tools: [
@@ -187,7 +191,8 @@ async function runToolPlan(openai: OpenAI, prompt: string, temperature: number):
         type: "function",
         function: {
           name: toolName,
-          description: "Return a 1-week training plan (Week 1) in a strict JSON structure.",
+          description:
+            "Return a 1-week training plan (Week 1) in a strict JSON structure.",
           parameters: {
             type: "object",
             additionalProperties: false,
@@ -204,7 +209,7 @@ async function runToolPlan(openai: OpenAI, prompt: string, temperature: number):
                   weeks: {
                     type: "array",
                     minItems: 1,
-                    maxItems: 1, // ✅ enforce only 1 week
+                    maxItems: 1,
                     items: {
                       type: "object",
                       additionalProperties: false,
@@ -364,16 +369,110 @@ function repairWeekSessions(args: {
     uniqueByDay.push(makeFallbackSession(d, goal, "Training"));
   }
 
-  uniqueByDay.sort((a, b) => trainingDays.indexOf(a.day) - trainingDays.indexOf(b.day));
+  uniqueByDay.sort(
+    (a, b) => trainingDays.indexOf(a.day) - trainingDays.indexOf(b.day)
+  );
 
   return { ...weekObj, week: 1, sessions: uniqueByDay.slice(0, daysPerWeek) };
+}
+
+/** -----------------------------
+ *  NEW: exerciseKey + optional exerciseId enrichment
+ *  ---------------------------- */
+
+function slugifyExerciseName(name: string) {
+  return safeStr(name)
+    .toLowerCase()
+    .replace(/&/g, "and")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/(^-|-$)/g, "")
+    .slice(0, 80);
+}
+
+/**
+ * Optional bulk resolve:
+ * - set EXERCISE_RESOLVE_URL to something like:
+ *   https://YOUR_DOMAIN/api/exercises/resolve
+ * - expects JSON response:
+ *   { ok: true, items: [{ name: "Barbell Bench Press", exerciseId: "abc123" }, ...] }
+ *
+ * If not configured or fails, we still add exerciseKey and keep exerciseId as null.
+ */
+async function resolveExerciseIdsByName(names: string[]) {
+  const url = process.env.EXERCISE_RESOLVE_URL;
+  if (!url) return new Map<string, string>();
+
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ names }),
+    });
+
+    const json: any = await res.json().catch(() => ({}));
+    if (!res.ok || !json?.ok || !Array.isArray(json?.items)) {
+      return new Map<string, string>();
+    }
+
+    const map = new Map<string, string>();
+    for (const it of json.items) {
+      const n = safeStr(it?.name);
+      const id = safeStr(it?.exerciseId);
+      if (n && id) map.set(n.toLowerCase(), id);
+    }
+    return map;
+  } catch {
+    return new Map<string, string>();
+  }
+}
+
+async function enrichWeekWithKeysAndIds(weekObj: any) {
+  const sessions = Array.isArray(weekObj?.sessions) ? weekObj.sessions : [];
+
+  // Collect unique exercise names
+  const nameSet = new Set<string>();
+  for (const s of sessions) {
+    const exs = Array.isArray(s?.exercises) ? s.exercises : [];
+    for (const ex of exs) {
+      const n = safeStr(ex?.name);
+      if (n) nameSet.add(n);
+    }
+  }
+  const names = Array.from(nameSet);
+
+  // Optional: resolve to ids
+  const idMap = await resolveExerciseIdsByName(names);
+
+  // Enrich
+  const enrichedSessions = sessions.map((s: any) => {
+    const exs = Array.isArray(s?.exercises) ? s.exercises : [];
+    const enrichedExercises = exs.map((ex: any) => {
+      const name = safeStr(ex?.name);
+      const exerciseKey = slugifyExerciseName(name);
+      const exerciseId = idMap.get(name.toLowerCase()) || null;
+
+      return {
+        ...ex,
+        name,
+        exerciseKey, // ✅ always present (launch-safe)
+        exerciseId, // ✅ present if resolver found a match
+      };
+    });
+
+    return { ...s, exercises: enrichedExercises };
+  });
+
+  return { ...weekObj, sessions: enrichedSessions };
 }
 
 export async function POST(req: Request) {
   try {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
-      return NextResponse.json({ ok: false, error: "Missing OPENAI_API_KEY" }, { status: 500 });
+      return NextResponse.json(
+        { ok: false, error: "Missing OPENAI_API_KEY" },
+        { status: 500 }
+      );
     }
 
     const openai = new OpenAI({ apiKey });
@@ -405,7 +504,9 @@ export async function POST(req: Request) {
 
     if (!parsed) {
       const message =
-        lastErr?.response?.data?.error?.message || lastErr?.message || "Unknown error";
+        lastErr?.response?.data?.error?.message ||
+        lastErr?.message ||
+        "Unknown error";
       return NextResponse.json({ ok: false, error: message }, { status: 400 });
     }
 
@@ -427,8 +528,13 @@ export async function POST(req: Request) {
       goal: parsed?.goal ?? input.goal,
     });
 
+    // ✅ Enrich exercises with stable key + optional id
+    const enrichedWeek1 = await enrichWeekWithKeysAndIds(repairedWeek1);
+
     // ✅ sanity check after repair
-    const sessions = Array.isArray(repairedWeek1?.sessions) ? repairedWeek1.sessions : [];
+    const sessions = Array.isArray(enrichedWeek1?.sessions)
+      ? enrichedWeek1.sessions
+      : [];
     if (sessions.length !== daysPerWeek) {
       return NextResponse.json(
         {
@@ -457,14 +563,16 @@ export async function POST(req: Request) {
       training_days: trainingDays,
       session_length_minutes: input.sessionMinutes,
       plan: {
-        weeks: [repairedWeek1], // ✅ only 1 week returned now
+        weeks: [enrichedWeek1], // ✅ now contains exerciseKey + optional exerciseId
       },
     };
 
     return NextResponse.json({ ok: true, plan });
   } catch (error: any) {
     const message =
-      error?.response?.data?.error?.message || error?.message || "Unknown error";
+      error?.response?.data?.error?.message ||
+      error?.message ||
+      "Unknown error";
 
     return NextResponse.json({ ok: false, error: message }, { status: 400 });
   }
