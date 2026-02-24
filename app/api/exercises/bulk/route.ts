@@ -26,8 +26,12 @@ g.__exerciseAllCache ??= null as null | { value: Exercise[]; expiresAt: number }
 const TTL_MS = 1000 * 60 * 60 * 24; // 24h
 const ALL_TTL_MS = 1000 * 60 * 60 * 6; // 6h
 
-const VERSION = "bulk-v9-bestResolutionPick";
+// ✅ bumped
+const VERSION = "bulk-v10-benchGuards+canonical";
 
+/** -------------------------------------------------------
+ * Helpers
+ * ------------------------------------------------------ */
 function normName(s: string) {
   return String(s ?? "")
     .trim()
@@ -37,16 +41,19 @@ function normName(s: string) {
 
 /**
  * ✅ Canonicalize plan exercise names → ExerciseDB-friendly queries
+ * This is the #1 place to fix mismatches like "Flat Dumbbell Press".
  */
 function canonicalQuery(raw: string) {
   const q = normName(raw);
 
   const map: Record<string, string> = {
+    // curls
     "dumbbell bicep curl": "dumbbell curl",
     "dumbbell biceps curl": "dumbbell curl",
     "bicep curl": "dumbbell curl",
     "hammer curl": "dumbbell hammer curl",
 
+    // pushups
     "push-up": "push-up",
     "push up": "push-up",
     pushup: "push-up",
@@ -54,6 +61,7 @@ function canonicalQuery(raw: string) {
     "push-ups": "push-up",
     "push ups": "push-up",
 
+    // deadlifts
     "deadlift ( light weight )": "deadlift",
     "deadlift (light weight)": "deadlift",
     "deadlift light weight": "deadlift",
@@ -62,7 +70,18 @@ function canonicalQuery(raw: string) {
     "deadlifts (light weight)": "deadlift",
     "deadlifts ( light weight )": "deadlift",
 
+    // pulldown
     "lat pulldown": "lat pulldown",
+
+    // ✅ BENCH / PRESSES (fix your mismatch)
+    "flat dumbbell press": "dumbbell bench press",
+    "dumbbell bench press": "dumbbell bench press",
+    "flat db press": "dumbbell bench press",
+    "incline barbell bench press": "incline bench press",
+    "incline barbell press": "incline bench press",
+
+    // dips
+    "chest dips": "dips",
   };
 
   return map[q] ?? q;
@@ -117,6 +136,7 @@ async function fetchJson(url: string) {
 
 /**
  * Better fuzzy match (uses equipment/target too)
+ * ✅ Added bench/chest intent guard + flat incline/decline penalties
  */
 function scoreMatchEx(query: string, ex: Exercise) {
   const q = normName(query);
@@ -153,13 +173,31 @@ function scoreMatchEx(query: string, ex: Exercise) {
 
   if (wantsBiceps) score += target.includes("biceps") ? 25 : -15;
 
+  // ✅ BENCH/CHEST intent guard (prevents weird matches)
+  const wantsBench =
+    qTokens.includes("bench") || qTokens.includes("press") || qTokens.includes("chest");
+
+  const isChestTarget = target.includes("pectorals") || target.includes("chest");
+  const isShoulderTarget =
+    target.includes("delts") || target.includes("shoulders") || target.includes("shoulder");
+
+  if (wantsBench) {
+    score += isChestTarget ? 22 : -10;
+    if (isShoulderTarget) score -= 18;
+  }
+
+  // ✅ "flat" hint → penalize incline/decline names when possible
+  if (qTokens.includes("flat")) {
+    if (n.includes("incline") || n.includes("decline")) score -= 12;
+  }
+
   if (qTokens.length <= 2 && nTokens.length >= 5) score -= 3;
 
   return score;
 }
 
 /* -------------------------------------------------------
-   ✅ NEW: pick exercise that actually has the BEST image resolution
+   ✅ pick exercise that actually has the BEST image resolution
 -------------------------------------------------------- */
 
 // cache best resolution per exerciseId (per instance)
@@ -236,7 +274,12 @@ async function pickBestWithImage(query: string, candidates: Exercise[]) {
  */
 async function fetchByNameOnce(query: string) {
   const q = canonicalQuery(query);
-  if (!q) return { ex: null as Exercise | null, bestRes: null as string | null, dbg: { step: "bad-query" } };
+  if (!q)
+    return {
+      ex: null as Exercise | null,
+      bestRes: null as string | null,
+      dbg: { step: "bad-query" },
+    };
 
   const url =
     `https://exercisedb.p.rapidapi.com/exercises/name/` +
@@ -272,7 +315,12 @@ async function fetchByNameOnce(query: string) {
 
   if (exact) {
     const bestRes = await getBestImageResolution(exact.id);
-    if (bestRes) return { ex: exact, bestRes, dbg: { step: "name-exact+bestRes", query: q, bestRes } };
+    if (bestRes)
+      return {
+        ex: exact,
+        bestRes,
+        dbg: { step: "name-exact+bestRes", query: q, bestRes },
+      };
     // if exact has no image, fallthrough to pick best with image
   }
 
@@ -386,10 +434,25 @@ async function fetchAllExercisesPaged(): Promise<{ list: Exercise[] | null; dbg:
 
 async function fetchByName(query: string) {
   const q = canonicalQuery(query);
-  if (!q) return { ex: null as Exercise | null, bestRes: null as string | null, dbg: { step: "bad-query" } };
+  if (!q)
+    return {
+      ex: null as Exercise | null,
+      bestRes: null as string | null,
+      dbg: { step: "bad-query" },
+    };
 
   const primary = await fetchByNameOnce(q);
   if (primary.ex) return primary;
+
+  // ✅ specific rescues (these fix your exact plan names)
+  if (q === "flat dumbbell press") {
+    const alt = await fetchByNameOnce("dumbbell bench press");
+    if (alt.ex) return { ex: alt.ex, bestRes: alt.bestRes, dbg: { step: "flat->db-bench" } };
+  }
+  if (q === "incline barbell bench press") {
+    const alt = await fetchByNameOnce("incline bench press");
+    if (alt.ex) return { ex: alt.ex, bestRes: alt.bestRes, dbg: { step: "incline-bb->incline-bench" } };
+  }
 
   if (q === "push-up") {
     const male = await fetchByNameOnce("push-up (male)");
@@ -399,7 +462,8 @@ async function fetchByName(query: string) {
     if (female.ex) return { ex: female.ex, bestRes: female.bestRes, dbg: { step: "pushup-female-forced" } };
 
     const bodyweight = await fetchByNameOnce("bodyweight push-up");
-    if (bodyweight.ex) return { ex: bodyweight.ex, bestRes: bodyweight.bestRes, dbg: { step: "pushup-bodyweight" } };
+    if (bodyweight.ex)
+      return { ex: bodyweight.ex, bestRes: bodyweight.bestRes, dbg: { step: "pushup-bodyweight" } };
   }
 
   if (q === "deadlift") {
@@ -408,10 +472,16 @@ async function fetchByName(query: string) {
   }
 
   const tryBarbell = await fetchByNameOnce(`barbell ${q}`);
-  if (tryBarbell.ex) return { ex: tryBarbell.ex, bestRes: tryBarbell.bestRes, dbg: { step: "prefix-barbell", from: primary.dbg } };
+  if (tryBarbell.ex)
+    return { ex: tryBarbell.ex, bestRes: tryBarbell.bestRes, dbg: { step: "prefix-barbell", from: primary.dbg } };
 
   const tryDumbbell = await fetchByNameOnce(`dumbbell ${q}`);
-  if (tryDumbbell.ex) return { ex: tryDumbbell.ex, bestRes: tryDumbbell.bestRes, dbg: { step: "prefix-dumbbell", from: primary.dbg } };
+  if (tryDumbbell.ex)
+    return {
+      ex: tryDumbbell.ex,
+      bestRes: tryDumbbell.bestRes,
+      dbg: { step: "prefix-dumbbell", from: primary.dbg },
+    };
 
   const allRes = await fetchAllExercisesPaged();
   if (!allRes.list) {
