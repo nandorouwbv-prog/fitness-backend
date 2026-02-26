@@ -16,19 +16,23 @@ const InputSchema = z.object({
   allowShirtless: z.boolean().optional().default(false),
 });
 
+const BASE_PROMPT =
+  "Realistic gym transformation of the same person. Preserve facial identity and facial structure. Shirtless neutral fitness context. Same pose, same camera angle, realistic gym lighting. Natural proportions, no exaggerated bodybuilder look.";
+
 function buildPrompt(kg: 3 | 6 | 9): string {
-  return (
-    `Create a realistic fitness progress photo of the same person after consistent gym training. ` +
-    `Same person identity, face unchanged and recognizable. ` +
-    `Person wearing a VERY fitted athletic tank top (skin-tight, thin fabric). ` +
-    `Strong gym lighting: hard key light, increased definition via shadows. ` +
-    `Subtle sweat sheen on skin, non-sexual. ` +
-    `Slightly closer crop on upper body (chest, shoulders, arms visible). ` +
-    `Realistic, natural results—no extreme bodybuilder look. ` +
-    `Keep background and pose similar to the original. ` +
-    `No nudity, no erotic context, neutral expression, neutral pose. ` +
-    `Add a subtle natural improvement in muscle definition and fullness (approximately ${kg} kg equivalent).`
-  );
+  const addition =
+    kg === 3
+      ? "Slight increase in lean muscle mass. Subtle improvement in chest, shoulders and arms."
+      : kg === 6
+        ? "Noticeable increase in lean muscle mass. Fuller chest, rounder shoulders, thicker arms, more visible abs."
+        : "Strong increase in lean muscle mass while remaining realistic. Significantly fuller chest, clearly round deltoids, thicker arms, tighter waist, visible abdominal definition.";
+  return `${BASE_PROMPT} ${addition}`;
+}
+
+function getStrength(kg: 3 | 6 | 9): number {
+  if (kg === 3) return 0.45;
+  if (kg === 6) return 0.55;
+  return 0.65;
 }
 
 async function pollUntilCompleted(
@@ -97,6 +101,7 @@ export async function POST(req: Request) {
     }
 
     const prompt = buildPrompt(kg);
+    const strength = getStrength(kg);
 
     try {
       const submitRes = await fetch(`${FAL_BASE}/${FAL_MODEL}`, {
@@ -108,7 +113,7 @@ export async function POST(req: Request) {
         body: JSON.stringify({
           image_url: imageDataUrl,
           prompt,
-          strength: 0.4,
+          strength,
         }),
       });
 
