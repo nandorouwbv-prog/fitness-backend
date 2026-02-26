@@ -4,6 +4,9 @@ import { NextResponse } from "next/server";
 
 export const runtime = "nodejs";
 
+const FAL_BASE = "https://queue.fal.run";
+const FAL_MODEL = "fal-ai/flux/dev/image-to-image";
+
 const MAX_DECODED_BYTES = 8 * 1024 * 1024; // ~8MB
 const MAX_BASE64_LENGTH = Math.floor((MAX_DECODED_BYTES * 4) / 3);
 
@@ -13,7 +16,7 @@ const InputSchema = z.object({
   allowShirtless: z.boolean().optional().default(false),
 });
 
-function buildPromptSafe(kg: 3 | 6 | 9): string {
+function buildPrompt(kg: 3 | 6 | 9): string {
   return (
     `Create a realistic fitness progress photo of the same person after consistent gym training. ` +
     `Same person identity, face unchanged and recognizable. ` +
@@ -28,33 +31,36 @@ function buildPromptSafe(kg: 3 | 6 | 9): string {
   );
 }
 
-function buildPromptShirtless(kg: 3 | 6 | 9): string {
-  return (
-    `Create a realistic fitness progress photo of the same person after consistent gym training. ` +
-    `Neutral fitness progress photo, non-sexual, no erotic context, no suggestive pose. ` +
-    `Keep the face identical and recognizable. Shirtless gym progress pose is allowed. ` +
-    `Maintain a similar pose, camera angle, lighting, and background. ` +
-    `Add a subtle natural improvement in muscle definition and fullness (approximately ${kg} kg equivalent). ` +
-    `Avoid exaggerated proportions. Keep it realistic.`
-  );
-}
-
-function isModerationOrSafetyError(errBody: string): boolean {
-  const lower = errBody.toLowerCase();
-  return (
-    lower.includes("moderation") ||
-    lower.includes("content_policy") ||
-    lower.includes("sexual") ||
-    lower.includes("safety")
-  );
+async function pollUntilCompleted(
+  statusUrl: string,
+  apiKey: string,
+  maxAttempts = 60,
+  intervalMs = 2000
+): Promise<void> {
+  for (let i = 0; i < maxAttempts; i++) {
+    const statusRes = await fetch(statusUrl, {
+      headers: { Authorization: `Key ${apiKey}` },
+    });
+    if (!statusRes.ok) {
+      throw new Error(`Status check failed: ${statusRes.status}`);
+    }
+    const statusData = (await statusRes.json()) as { status?: string };
+    if (statusData.status === "COMPLETED") return;
+    if (statusData.status === "FAILED") {
+      throw new Error("Fal queue job failed");
+    }
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  throw new Error("Fal queue timeout");
 }
 
 export async function POST(req: Request) {
   try {
-    const apiKey = process.env.OPENAI_API_KEY;
+    console.log("FAL_KEY exists?", !!process.env.FAL_KEY);
+    const apiKey = process.env.FAL_KEY;
     if (!apiKey) {
       return NextResponse.json(
-        { error: "Missing OPENAI_API_KEY" },
+        { error: "Missing FAL_KEY" },
         { status: 500 }
       );
     }
@@ -67,7 +73,7 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: msg }, { status: 400 });
     }
 
-    const { imageDataUrl, kg, allowShirtless } = parsed.data;
+    const { imageDataUrl, kg } = parsed.data;
 
     if (!imageDataUrl.startsWith("data:image/")) {
       return NextResponse.json(
@@ -90,74 +96,80 @@ export async function POST(req: Request) {
       );
     }
 
-    const prompt = allowShirtless ? buildPromptShirtless(kg) : buildPromptSafe(kg);
-
-    const buffer = Buffer.from(base64Part, "base64");
-    const formData = new FormData();
-    formData.append("model", "gpt-image-1");
-    formData.append("prompt", prompt);
-    formData.append("image", new Blob([buffer], { type: "image/png" }), "input.png");
+    const prompt = buildPrompt(kg);
 
     try {
-      let res = await fetch("https://api.openai.com/v1/images/edits", {
+      const submitRes = await fetch(`${FAL_BASE}/${FAL_MODEL}`, {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${apiKey}`,
+          Authorization: `Key ${apiKey}`,
+          "Content-Type": "application/json",
         },
-        body: formData,
+        body: JSON.stringify({
+          image_url: imageDataUrl,
+          prompt,
+          strength: 0.4,
+        }),
       });
 
-      if (!res.ok && allowShirtless) {
-        const errBody = await res.text();
-        if (isModerationOrSafetyError(errBody)) {
-          const safeFormData = new FormData();
-          safeFormData.append("model", "gpt-image-1");
-          safeFormData.append("prompt", buildPromptSafe(kg));
-          safeFormData.append("image", new Blob([buffer], { type: "image/png" }), "input.png");
-          res = await fetch("https://api.openai.com/v1/images/edits", {
-            method: "POST",
-            headers: {
-              Authorization: `Bearer ${apiKey}`,
-            },
-            body: safeFormData,
-          });
-        } else {
-          const lastError = new Error(errBody || `OpenAI API error: ${res.status}`);
-          console.error("OpenAI response body:", errBody);
-          console.error("Transform error:", lastError);
+      if (!submitRes.ok) {
+        const errBody = await submitRes.text();
+        console.error("Fal submit response body:", errBody);
+        return NextResponse.json(
+          { error: "Image transformation failed", detail: errBody },
+          { status: 500 }
+        );
+      }
+
+      const submitData = (await submitRes.json()) as {
+        request_id?: string;
+        response_url?: string;
+        status_url?: string;
+        images?: Array<{ url?: string }>;
+      };
+
+      let resultData: { images?: Array<{ url?: string }> };
+      if (submitData.images && submitData.images.length > 0) {
+        resultData = submitData;
+      } else if (submitData.request_id && submitData.status_url) {
+        await pollUntilCompleted(submitData.status_url, apiKey);
+        const resultRes = await fetch(submitData.response_url!, {
+          headers: { Authorization: `Key ${apiKey}` },
+        });
+        if (!resultRes.ok) {
+          const errBody = await resultRes.text();
+          console.error("Fal result response:", errBody);
           return NextResponse.json(
-            { error: "Image transformation failed", detail: String(lastError) },
+            { error: "Image transformation failed", detail: errBody },
             { status: 500 }
           );
         }
-      }
-
-      if (!res.ok) {
-        const errBody = await res.text();
-        const lastError = new Error(errBody || `OpenAI API error: ${res.status}`);
-        console.error("OpenAI response body:", errBody);
-        console.error("Transform error:", lastError);
+        resultData = (await resultRes.json()) as { images?: Array<{ url?: string }> };
+      } else {
         return NextResponse.json(
-          { error: "Image transformation failed", detail: String(lastError) },
+          { error: "Image transformation failed", detail: "Unexpected fal response" },
           { status: 500 }
         );
       }
 
-      const data = (await res.json()) as {
-        data?: Array<{ b64_json?: string }>;
-      };
-
-      const first = data?.data?.[0];
-      const b64 = first?.b64_json;
-
-      if (!b64 || typeof b64 !== "string") {
-        const err = new Error("No b64_json in response");
-        console.error("Transform error:", err);
+      const imageUrl = resultData.images?.[0]?.url;
+      if (!imageUrl || typeof imageUrl !== "string") {
         return NextResponse.json(
-          { error: "Image transformation failed", detail: String(err) },
+          { error: "Image transformation failed", detail: "No image URL in result" },
           { status: 500 }
         );
       }
+
+      const imageRes = await fetch(imageUrl);
+      if (!imageRes.ok) {
+        console.error("Fetch image failed:", imageRes.status);
+        return NextResponse.json(
+          { error: "Image transformation failed", detail: "Failed to fetch result image" },
+          { status: 500 }
+        );
+      }
+      const imageBytes = await imageRes.arrayBuffer();
+      const b64 = Buffer.from(imageBytes).toString("base64");
 
       return NextResponse.json({ b64 });
     } catch (err) {
