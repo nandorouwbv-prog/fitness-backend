@@ -89,11 +89,13 @@ export async function POST(req: Request) {
         if (!res.ok) {
           const errBody = await res.text();
           lastError = new Error(errBody || `OpenAI API error: ${res.status}`);
+          console.error("OpenAI response body:", errBody);
+          console.error("Transform error:", lastError);
           if (model === "gpt-image-1.5" && res.status >= 400) {
             continue;
           }
           return NextResponse.json(
-            { error: "Image transformation failed" },
+            { error: "Image transformation failed", detail: String(lastError) },
             { status: 500 }
           );
         }
@@ -106,8 +108,10 @@ export async function POST(req: Request) {
         const b64 = first?.b64_json;
 
         if (!b64 || typeof b64 !== "string") {
+          const err = new Error("No b64_json in response");
+          console.error("Transform error:", err);
           return NextResponse.json(
-            { error: "Image transformation failed" },
+            { error: "Image transformation failed", detail: String(err) },
             { status: 500 }
           );
         }
@@ -115,16 +119,18 @@ export async function POST(req: Request) {
         return NextResponse.json({ b64 });
       } catch (err) {
         lastError = err;
+        console.error("Transform error:", err);
         if (model === "gpt-image-1.5") continue;
         return NextResponse.json(
-          { error: "Image transformation failed" },
+          { error: "Image transformation failed", detail: String(err) },
           { status: 500 }
         );
       }
     }
 
+    console.error("Transform error:", lastError);
     return NextResponse.json(
-      { error: "Image transformation failed" },
+      { error: "Image transformation failed", detail: String(lastError ?? "Unknown") },
       { status: 500 }
     );
   } catch (err: unknown) {
