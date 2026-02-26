@@ -10,9 +10,10 @@ const MAX_BASE64_LENGTH = Math.floor((MAX_DECODED_BYTES * 4) / 3);
 const InputSchema = z.object({
   imageDataUrl: z.string().min(1),
   kg: z.union([z.literal(3), z.literal(6), z.literal(9)]),
+  allowShirtless: z.boolean().optional().default(false),
 });
 
-function buildPrompt(kg: 3 | 6 | 9): string {
+function buildPromptSafe(kg: 3 | 6 | 9): string {
   return (
     `Create a realistic fitness progress photo of the same person after consistent gym training. ` +
     `Keep the face identical and recognizable. ` +
@@ -20,6 +21,27 @@ function buildPrompt(kg: 3 | 6 | 9): string {
     `Maintain a similar pose, camera angle, lighting, and background. ` +
     `Add a subtle natural improvement in muscle definition and fullness (approximately ${kg} kg equivalent). ` +
     `Avoid exaggerated proportions. Keep it realistic.`
+  );
+}
+
+function buildPromptShirtless(kg: 3 | 6 | 9): string {
+  return (
+    `Create a realistic fitness progress photo of the same person after consistent gym training. ` +
+    `Neutral fitness progress photo, non-sexual, no erotic context, no suggestive pose. ` +
+    `Keep the face identical and recognizable. Shirtless gym progress pose is allowed. ` +
+    `Maintain a similar pose, camera angle, lighting, and background. ` +
+    `Add a subtle natural improvement in muscle definition and fullness (approximately ${kg} kg equivalent). ` +
+    `Avoid exaggerated proportions. Keep it realistic.`
+  );
+}
+
+function isModerationOrSafetyError(errBody: string): boolean {
+  const lower = errBody.toLowerCase();
+  return (
+    lower.includes("moderation") ||
+    lower.includes("content_policy") ||
+    lower.includes("sexual") ||
+    lower.includes("safety")
   );
 }
 
@@ -41,7 +63,7 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: msg }, { status: 400 });
     }
 
-    const { imageDataUrl, kg } = parsed.data;
+    const { imageDataUrl, kg, allowShirtless } = parsed.data;
 
     if (!imageDataUrl.startsWith("data:image/")) {
       return NextResponse.json(
@@ -64,7 +86,7 @@ export async function POST(req: Request) {
       );
     }
 
-    const prompt = buildPrompt(kg);
+    const prompt = allowShirtless ? buildPromptShirtless(kg) : buildPromptSafe(kg);
 
     const buffer = Buffer.from(base64Part, "base64");
     const formData = new FormData();
@@ -73,13 +95,38 @@ export async function POST(req: Request) {
     formData.append("image", new Blob([buffer], { type: "image/png" }), "input.png");
 
     try {
-      const res = await fetch("https://api.openai.com/v1/images/edits", {
+      let res = await fetch("https://api.openai.com/v1/images/edits", {
         method: "POST",
         headers: {
           Authorization: `Bearer ${apiKey}`,
         },
         body: formData,
       });
+
+      if (!res.ok && allowShirtless) {
+        const errBody = await res.text();
+        if (isModerationOrSafetyError(errBody)) {
+          const safeFormData = new FormData();
+          safeFormData.append("model", "gpt-image-1");
+          safeFormData.append("prompt", buildPromptSafe(kg));
+          safeFormData.append("image", new Blob([buffer], { type: "image/png" }), "input.png");
+          res = await fetch("https://api.openai.com/v1/images/edits", {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${apiKey}`,
+            },
+            body: safeFormData,
+          });
+        } else {
+          const lastError = new Error(errBody || `OpenAI API error: ${res.status}`);
+          console.error("OpenAI response body:", errBody);
+          console.error("Transform error:", lastError);
+          return NextResponse.json(
+            { error: "Image transformation failed", detail: String(lastError) },
+            { status: 500 }
+          );
+        }
+      }
 
       if (!res.ok) {
         const errBody = await res.text();
