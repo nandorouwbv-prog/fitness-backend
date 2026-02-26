@@ -69,7 +69,7 @@ export async function POST(req: Request) {
         body: JSON.stringify({
           model: "gpt-image-1",
           prompt,
-          image: imageDataUrl,
+          input_image: imageDataUrl,
           size: "1024x1024",
         }),
       });
