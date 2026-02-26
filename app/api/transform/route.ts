@@ -16,11 +16,15 @@ const InputSchema = z.object({
 function buildPromptSafe(kg: 3 | 6 | 9): string {
   return (
     `Create a realistic fitness progress photo of the same person after consistent gym training. ` +
-    `Keep the face identical and recognizable. ` +
-    `Show the person wearing a fitted athletic tank top or t-shirt (no shirtless, no nudity). ` +
-    `Maintain a similar pose, camera angle, lighting, and background. ` +
-    `Add a subtle natural improvement in muscle definition and fullness (approximately ${kg} kg equivalent). ` +
-    `Avoid exaggerated proportions. Keep it realistic.`
+    `Same person identity, face unchanged and recognizable. ` +
+    `Person wearing a VERY fitted athletic tank top (skin-tight, thin fabric). ` +
+    `Strong gym lighting: hard key light, increased definition via shadows. ` +
+    `Subtle sweat sheen on skin, non-sexual. ` +
+    `Slightly closer crop on upper body (chest, shoulders, arms visible). ` +
+    `Realistic, natural results—no extreme bodybuilder look. ` +
+    `Keep background and pose similar to the original. ` +
+    `No nudity, no erotic context, neutral expression, neutral pose. ` +
+    `Add a subtle natural improvement in muscle definition and fullness (approximately ${kg} kg equivalent).`
   );
 }
 
