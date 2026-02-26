@@ -13,7 +13,14 @@ const InputSchema = z.object({
 });
 
 function buildPrompt(kg: 3 | 6 | 9): string {
-  return `Create a realistic fitness transformation of the same person after consistent training. Subtle natural muscle gain (~${kg} kg). Same face, same pose, same lighting, same background. No exaggerated proportions.`;
+  return (
+    `Create a realistic fitness progress photo of the same person after consistent gym training. ` +
+    `Keep the face identical and recognizable. ` +
+    `Show the person wearing a fitted athletic tank top or t-shirt (no shirtless, no nudity). ` +
+    `Maintain a similar pose, camera angle, lighting, and background. ` +
+    `Add a subtle natural improvement in muscle definition and fullness (approximately ${kg} kg equivalent). ` +
+    `Avoid exaggerated proportions. Keep it realistic.`
+  );
 }
 
 export async function POST(req: Request) {
