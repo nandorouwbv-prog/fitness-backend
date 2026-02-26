@@ -14,11 +14,12 @@ const InputSchema = z.object({
 
 function buildPrompt(kg: 3 | 6 | 9): string {
   return (
-    `Edit this photo to show the same person with a natural, achievable physique change. ` +
-    `Keep the person's identity and face exactly the same. ` +
-    `Increase lean muscle mass by approximately ${kg} kg in a realistic way—athletic and fit, not extreme. ` +
-    `Keep lighting, background, and pose similar to the original. ` +
-    `Avoid an extreme bodybuilder or steroid look; aim for a natural, healthy fitness appearance.`
+    `Enhance this photo to show the same person after consistent gym training. ` +
+    `Add a subtle, natural increase in lean muscle tone (approximately ${kg} kg equivalent). ` +
+    `Keep the face identical. ` +
+    `Maintain the same lighting, pose, and background. ` +
+    `Avoid exaggerated or bodybuilder proportions. ` +
+    `Make it realistic and believable.`
   );
 }
 
