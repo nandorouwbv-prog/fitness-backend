@@ -13,14 +13,7 @@ const InputSchema = z.object({
 });
 
 function buildPrompt(kg: 3 | 6 | 9): string {
-  return (
-    `Enhance this photo to show the same person after consistent gym training. ` +
-    `Add a subtle, natural increase in lean muscle tone (approximately ${kg} kg equivalent). ` +
-    `Keep the face identical. ` +
-    `Maintain the same lighting, pose, and background. ` +
-    `Avoid exaggerated or bodybuilder proportions. ` +
-    `Make it realistic and believable.`
-  );
+  return `Create a realistic fitness transformation of the same person after consistent training. Subtle natural muscle gain (~${kg} kg). Same face, same pose, same lighting, same background. No exaggerated proportions.`;
 }
 
 export async function POST(req: Request) {
@@ -65,75 +58,57 @@ export async function POST(req: Request) {
     }
 
     const prompt = buildPrompt(kg);
-    const models: ("gpt-image-1.5" | "gpt-image-1")[] = ["gpt-image-1.5", "gpt-image-1"];
 
-    let lastError: unknown = null;
+    try {
+      const res = await fetch("https://api.openai.com/v1/images/generations", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "gpt-image-1",
+          prompt,
+          image: imageDataUrl,
+          size: "1024x1024",
+        }),
+      });
 
-    for (const model of models) {
-      try {
-        const res = await fetch("https://api.openai.com/v1/images/edits", {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${apiKey}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            model,
-            images: [{ image_url: imageDataUrl }],
-            prompt,
-            input_fidelity: "high",
-            n: 1,
-            output_format: "png",
-          }),
-        });
+      if (!res.ok) {
+        const errBody = await res.text();
+        const lastError = new Error(errBody || `OpenAI API error: ${res.status}`);
+        console.error("OpenAI response body:", errBody);
+        console.error("Transform error:", lastError);
+        return NextResponse.json(
+          { error: "Image transformation failed", detail: String(lastError) },
+          { status: 500 }
+        );
+      }
 
-        if (!res.ok) {
-          const errBody = await res.text();
-          lastError = new Error(errBody || `OpenAI API error: ${res.status}`);
-          console.error("OpenAI response body:", errBody);
-          console.error("Transform error:", lastError);
-          if (model === "gpt-image-1.5" && res.status >= 400) {
-            continue;
-          }
-          return NextResponse.json(
-            { error: "Image transformation failed", detail: String(lastError) },
-            { status: 500 }
-          );
-        }
+      const data = (await res.json()) as {
+        data?: Array<{ b64_json?: string }>;
+      };
 
-        const data = (await res.json()) as {
-          data?: Array<{ b64_json?: string }>;
-        };
+      const first = data?.data?.[0];
+      const b64 = first?.b64_json;
 
-        const first = data?.data?.[0];
-        const b64 = first?.b64_json;
-
-        if (!b64 || typeof b64 !== "string") {
-          const err = new Error("No b64_json in response");
-          console.error("Transform error:", err);
-          return NextResponse.json(
-            { error: "Image transformation failed", detail: String(err) },
-            { status: 500 }
-          );
-        }
-
-        return NextResponse.json({ b64 });
-      } catch (err) {
-        lastError = err;
+      if (!b64 || typeof b64 !== "string") {
+        const err = new Error("No b64_json in response");
         console.error("Transform error:", err);
-        if (model === "gpt-image-1.5") continue;
         return NextResponse.json(
           { error: "Image transformation failed", detail: String(err) },
           { status: 500 }
         );
       }
-    }
 
-    console.error("Transform error:", lastError);
-    return NextResponse.json(
-      { error: "Image transformation failed", detail: String(lastError ?? "Unknown") },
-      { status: 500 }
-    );
+      return NextResponse.json({ b64 });
+    } catch (err) {
+      console.error("Transform error:", err);
+      return NextResponse.json(
+        { error: "Image transformation failed", detail: String(err) },
+        { status: 500 }
+      );
+    }
   } catch (err: unknown) {
     return NextResponse.json(
       { error: err instanceof Error ? "Bad request" : "Bad request" },
