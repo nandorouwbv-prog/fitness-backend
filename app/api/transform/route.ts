@@ -59,19 +59,19 @@ export async function POST(req: Request) {
 
     const prompt = buildPrompt(kg);
 
+    const buffer = Buffer.from(base64Part, "base64");
+    const formData = new FormData();
+    formData.append("model", "gpt-image-1");
+    formData.append("prompt", prompt);
+    formData.append("image", new Blob([buffer], { type: "image/png" }), "input.png");
+
     try {
-      const res = await fetch("https://api.openai.com/v1/images/generations", {
+      const res = await fetch("https://api.openai.com/v1/images/edits", {
         method: "POST",
         headers: {
           Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-          model: "gpt-image-1",
-          prompt,
-          input_image: imageDataUrl,
-          size: "1024x1024",
-        }),
+        body: formData,
       });
 
       if (!res.ok) {
