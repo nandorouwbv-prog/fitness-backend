@@ -49,10 +49,12 @@ async function getRetinaSession(): Promise<ort.InferenceSession | null> {
 }
 
 function buildPrompt(kg: 3 | 6 | 9, mode: "safe" | "shirtless"): string {
-  const kgNote =
+  const intensity =
     kg === 9
-      ? " For 9 kg, the muscle gain must be very noticeable and visually impactful, while remaining realistic."
-      : "";
+      ? "Significant hypertrophy. Dramatically larger upper body. Clearly thicker chest, rounder and wider deltoids, visibly bigger triceps and biceps. The increase in muscle mass must be obvious and impactful compared to the original photo. Maintain realistic anatomy but the transformation must be visually strong. "
+      : kg === 6
+        ? "Noticeable increase in lean muscle mass. Fuller chest, rounder shoulders, thicker arms, more visible upper back and overall muscular fullness. "
+        : "Subtle increase in lean muscle mass. Slight improvement in chest, shoulders, and arms. ";
   const base =
     "This is a realistic male fitness progress transformation. " +
     "Edit the uploaded image of the SAME PERSON. Preserve the exact original facial identity. " +
@@ -60,14 +62,17 @@ function buildPrompt(kg: 3 | 6 | 9, mode: "safe" | "shirtless"): string {
     "Do NOT alter eye shape, eye distance, nose structure, or lip shape. Do NOT change age. " +
     "Only modify muscle mass below the neck. " +
     `Increase lean muscle mass by approximately ${kg} kg. ` +
+    intensity +
     "Muscle growth should be clearly visible in: chest thickness, shoulder roundness, biceps and triceps size, upper back density, overall muscular fullness. " +
     "Keep the same: pose, background, lighting, camera angle, skin tone, tattoo placement. " +
-    "Photorealistic. Natural anatomy. No exaggerated proportions." +
-    kgNote;
+    "Do not modify the face, eyes, nose, mouth, jawline, or skull structure in any way. " +
+    "The face must remain identical to the original image. " +
+    "Only the body from the clavicle down may change. " +
+    "Photorealistic. Natural anatomy. No exaggerated proportions. ";
   const clothing =
     mode === "safe"
-      ? " Show the person wearing a fitted athletic tank top. Male fitness progress photo, non-sexual, professional gym lighting."
-      : " Male fitness progress photo, bare torso, wearing shorts, non-sexual, professional gym lighting.";
+      ? "Show the person wearing a fitted athletic tank top. Male fitness progress photo, non-sexual, professional gym lighting."
+      : "Male fitness progress photo, bare torso, wearing shorts, non-sexual, professional gym lighting.";
   return base + clothing;
 }
 
@@ -167,6 +172,20 @@ async function detectFace(
   return decodeRetinaOutput(out, w, h);
 }
 
+function tightenBox(box: FaceBox, imgW: number, imgH: number): FaceBox {
+  const maxW = imgW * 0.32;
+  const maxH = imgH * 0.28;
+  const w = Math.min(box.w, Math.max(16, Math.round(maxW)));
+  const h = Math.min(box.h, Math.max(16, Math.round(maxH)));
+  const cx = box.x + box.w / 2;
+  const cy = box.y + box.h / 2;
+  let x = Math.round(cx - w / 2);
+  let y = Math.round(cy - h / 2);
+  x = Math.max(0, Math.min(imgW - w, x));
+  y = Math.max(0, Math.min(imgH - h, y));
+  return { x, y, w, h };
+}
+
 function expandBox(box: FaceBox, imgW: number, imgH: number): FaceBox {
   const pad = 0.15;
   const dw = box.w * pad;
@@ -180,13 +199,13 @@ function expandBox(box: FaceBox, imgW: number, imgH: number): FaceBox {
   return { x, y, w, h };
 }
 
-function ovalMask(w: number, h: number, featherPx: number): Buffer {
+function ovalMask(w: number, h: number, _featherPx: number): Buffer {
   const buf = Buffer.alloc(w * h);
   const cx = w / 2;
   const cy = h / 2;
   const rx = (w * 0.85) / 2;
   const ry = (h * 0.9) / 2;
-  const inner = 1 - featherPx / Math.max(rx, ry);
+  const inner = 0.75;
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const dx = (x - cx) / rx;
@@ -231,7 +250,9 @@ async function faceLockComposite(
   const boxGen = await detectFace(session, genRgba.data, genW, genH);
   if (!boxOrig || !boxGen) return generatedB64;
 
-  const expanded = expandBox(boxOrig, origW, origH);
+  const tightOrig = tightenBox(boxOrig, origW, origH);
+  const tightGen = tightenBox(boxGen, genW, genH);
+  const expanded = expandBox(tightOrig, origW, origH);
 
   const origPatch = await sharp(originalBuf)
     .extract({
@@ -251,13 +272,13 @@ async function faceLockComposite(
       channels: 4,
     },
   })
-    .resize(boxGen.w, boxGen.h, { fit: "fill" })
+    .resize(tightGen.w, tightGen.h, { fit: "fill" })
     .raw()
     .toBuffer({ resolveWithObject: true });
 
-  const maskBuf = ovalMask(boxGen.w, boxGen.h, OVAL_MASK_FEATHER_PX);
-  const overlayRgba = Buffer.alloc(boxGen.w * boxGen.h * 4);
-  for (let i = 0; i < boxGen.w * boxGen.h; i++) {
+  const maskBuf = ovalMask(tightGen.w, tightGen.h, OVAL_MASK_FEATHER_PX);
+  const overlayRgba = Buffer.alloc(tightGen.w * tightGen.h * 4);
+  for (let i = 0; i < tightGen.w * tightGen.h; i++) {
     const a = maskBuf[i] / 255;
     overlayRgba[i * 4 + 0] = resized.data[i * 4 + 0];
     overlayRgba[i * 4 + 1] = resized.data[i * 4 + 1];
@@ -266,7 +287,7 @@ async function faceLockComposite(
   }
 
   const overlayImg = await sharp(overlayRgba, {
-    raw: { width: boxGen.w, height: boxGen.h, channels: 4 },
+    raw: { width: tightGen.w, height: tightGen.h, channels: 4 },
   })
     .png()
     .toBuffer();
@@ -275,8 +296,8 @@ async function faceLockComposite(
     .composite([
       {
         input: overlayImg,
-        left: boxGen.x,
-        top: boxGen.y,
+        left: tightGen.x,
+        top: tightGen.y,
         blend: "over",
       },
     ])
