@@ -17,18 +17,22 @@ const InputSchema = z.object({
 });
 
 function buildPrompt(kg: 3 | 6 | 9): string {
+  const kgNote =
+    kg === 9
+      ? " For 9 kg, the muscle gain must be very noticeable and visually impactful, while remaining realistic."
+      : "";
   return (
-    "This is a realistic male fitness progress photo. " +
-    "Edit the uploaded image of the SAME PERSON. " +
-    "Preserve the exact facial identity, skull shape, eye distance, nose structure, jawline, and tattoo placement. " +
-    "Preserve background, lighting, camera angle, pose, and skin tone. " +
+    "This is a realistic male fitness progress transformation. " +
+    "Edit the uploaded image of the SAME PERSON. Preserve the exact original facial identity. " +
+    "CRITICAL: Do NOT modify facial structure. Do NOT change jawline or skull proportions. " +
+    "Do NOT alter eye shape, eye distance, nose structure, or lip shape. Do NOT change age. " +
+    "Only modify muscle mass below the neck. " +
     `Increase lean muscle mass by approximately ${kg} kg. ` +
-    "Muscle growth must be clearly visible in: " +
-    "chest thickness, shoulder roundness, triceps and biceps size, upper back density, slight increase in overall muscular fullness. " +
-    "The physique should look like a natural but highly trained athlete at peak condition. " +
-    "Maintain realism and anatomical accuracy. No exaggerated proportions. No cartoonish features. " +
+    "Muscle growth should be clearly visible in: chest thickness, shoulder roundness, biceps and triceps size, upper back density, overall muscular fullness. " +
+    "Keep the same: pose, background, lighting, camera angle, skin tone, tattoo placement. " +
     "Male fitness progress photo, bare torso, wearing shorts, non-sexual, professional gym lighting. " +
-    "Photorealistic, high detail."
+    "Photorealistic. Natural anatomy. No exaggerated proportions." +
+    kgNote
   );
 }
 
