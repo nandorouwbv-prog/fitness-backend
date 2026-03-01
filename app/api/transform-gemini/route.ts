@@ -13,6 +13,17 @@ const InputSchema = z.object({
   mode: z.enum(["safe", "shirtless"]).optional().default("safe"),
 });
 
+type GeminiGenerateResponse = {
+  candidates?: Array<{
+    content?: {
+      parts?: Array<{
+        text?: string;
+        inlineData?: { mimeType?: string; data?: string };
+      }>;
+    };
+  }>;
+};
+
 function buildPrompt(kg: 3 | 6 | 9, mode: "safe" | "shirtless"): string {
   const intensity =
     kg === 3
@@ -110,16 +121,8 @@ export async function POST(req: Request) {
         }),
       });
 
-      const data = (await res.json()) as {
-        candidates?: Array<{
-          content?: {
-            parts?: Array<{
-              text?: string;
-              inlineData?: { mimeType?: string; data?: string };
-            }>;
-          };
-        }>;
-        const errorPayload = data as { error?: { message?: string } };
+      const data = (await res.json()) as GeminiGenerateResponse;
+      const errorPayload = data as any;
 
       if (!res.ok) {
         const detail = errorPayload?.error?.message ?? "Gemini API error";
