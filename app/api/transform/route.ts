@@ -16,17 +16,20 @@ const InputSchema = z.object({
   allowShirtless: z.boolean().optional().default(false),
 });
 
-const BASE_PROMPT =
-  "Realistic gym transformation of the same person. Preserve facial identity and facial structure. Shirtless neutral fitness context. Same pose, same camera angle, realistic gym lighting. Natural proportions, no exaggerated bodybuilder look.";
-
 function buildPrompt(kg: 3 | 6 | 9): string {
-  const addition =
-    kg === 3
-      ? "Slight increase in lean muscle mass. Subtle improvement in chest, shoulders and arms."
-      : kg === 6
-        ? "Noticeable increase in lean muscle mass. Fuller chest, rounder shoulders, thicker arms, more visible abs."
-        : "Strong increase in lean muscle mass while remaining realistic. Significantly fuller chest, clearly round deltoids, thicker arms, tighter waist, visible abdominal definition.";
-  return `${BASE_PROMPT} ${addition}`;
+  return (
+    "This is a realistic male fitness progress photo. " +
+    "Edit the uploaded image of the SAME PERSON. " +
+    "Preserve the exact facial identity, skull shape, eye distance, nose structure, jawline, and tattoo placement. " +
+    "Preserve background, lighting, camera angle, pose, and skin tone. " +
+    `Increase lean muscle mass by approximately ${kg} kg. ` +
+    "Muscle growth must be clearly visible in: " +
+    "chest thickness, shoulder roundness, triceps and biceps size, upper back density, slight increase in overall muscular fullness. " +
+    "The physique should look like a natural but highly trained athlete at peak condition. " +
+    "Maintain realism and anatomical accuracy. No exaggerated proportions. No cartoonish features. " +
+    "Male fitness progress photo, bare torso, wearing shorts, non-sexual, professional gym lighting. " +
+    "Photorealistic, high detail."
+  );
 }
 
 function getStrength(kg: 3 | 6 | 9): number {
